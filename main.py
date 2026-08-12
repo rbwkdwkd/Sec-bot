@@ -8,23 +8,18 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 def main():
     print("1. Gemini Interactions API 요청 중...")
     
-    # Google 권장 Interactions API 최신 엔드포인트
     url = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={GEMINI_API_KEY}"
     
     headers = {
         "Content-Type": "application/json"
     }
     
-    # Interactions API 전용 payload 규격
+    # Interactions API 필수 'type' 파라미터 추가
     payload = {
         "model": "models/gemini-2.5-flash",
         "input": {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "오늘 미국 증시 개장 전 주요 체크포인트 3가지를 텔레그램 메시지용으로 짧고 간결하게 한국어로 작성해줘."
-                }
-            ]
+            "type": "text",
+            "text": "오늘 미국 증시 개장 전 주요 체크포인트 3가지를 텔레그램 메시지용으로 짧고 간결하게 한국어로 작성해줘."
         }
     }
     
@@ -33,14 +28,13 @@ def main():
         res_json = response.json()
         
         if response.status_code == 200:
-            # Interactions API 응답 구조 추출
             outputs = res_json.get("outputs", [])
             if outputs and "text" in outputs[0]:
                 report_text = outputs[0]["text"]
             elif "text" in res_json:
                 report_text = res_json["text"]
             else:
-                report_text = f"응답 해석 완료: {res_json}"
+                report_text = str(res_json)
             print("2. AI 리포트 생성 성공!")
         else:
             err_msg = res_json.get("error", {}).get("message", res_json)
