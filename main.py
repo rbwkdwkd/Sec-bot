@@ -11,7 +11,7 @@ def main():
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.0-flash",
             contents="오늘 미국 증시 개장 전 주요 체크포인트 3가지를 텔레그램 메시지용으로 짧고 간결하게 한국어로 작성해줘.",
         )
         report_text = response.text
