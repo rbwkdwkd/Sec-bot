@@ -1,13 +1,11 @@
-name: US Stock Strategy Radar
+name: 미국 주식 전략 레이더
 
 on:
 
   workflow_dispatch:
 
   schedule:
-
-    # 매시 정각 실행
-    # GitHub Actions의 schedule은 UTC 기준
+    # 매시간 정각 실행
     - cron: "0 * * * *"
 
 jobs:
@@ -20,32 +18,24 @@ jobs:
 
     steps:
 
-      - name: Checkout
+      - name: 코드 가져오기
         uses: actions/checkout@v4
 
-      - name: Python 설치
+      - name: Python 설정
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: 패키지 설치
+      - name: 필요한 라이브러리 설치
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 미국 주식 전략 분석
+      - name: 미국 주식 전략 레이더 실행
         env:
-
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-          GEMINI_MODEL: gemini-2.5-flash
-
         run: |
-
           python main.py
