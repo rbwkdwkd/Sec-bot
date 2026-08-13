@@ -1,3 +1,1 @@
-requests
-yfinance==1.5.2
-feedparser
+requests>=2.32.0
