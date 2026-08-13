@@ -4,37 +4,1317 @@ import time
 import math
 import requests
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
+
 
 # ============================================================
 # 미국 주식 전략 레이더
-# Gemini 3.6 Flash + Interactions API
+# ============================================================
+#
+# 기능
+# 1. Yahoo Finance 가격/거래량 자동 수집
+# 2. query1 -> query2 자동 fallback
+# 3. 시장 데이터 오류가 일부 발생해도 전체 프로그램 중단 방지
+# 4. 대형주 + 중형주 + 소형주 후보군
+# 5. 가격/거래량/모멘텀 기반 1차 점수
+# 6. Gemini 최신 AI 분석
+# 7. AI 실패 시에도 실제 시장 데이터 기반 결과 전송
+# 8. GitHub/Google Trends 분석 아이디어를 AI 분석 규칙에 반영
+# 9. TOP 10 종목 선정
+# 10. 텔레그램 전송
+#
+# 주의:
+# 이 프로그램은 투자자문/매매자동화가 아니라
+# 정보 분석 및 후보 탐색용이다.
 # ============================================================
 
-# =========================
+
+# ============================================================
 # 환경변수
-# =========================
+# ============================================================
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# 선택사항
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
-# Gemini 최신 모델
-GEMINI_MODEL = "gemini-3.6-flash"
+# ============================================================
+# 설정
+# ============================================================
 
-# 한국시간
 KST = timezone(timedelta(hours=9))
 
-# 데이터 저장 파일
-STATE_FILE = "market_state.json"
+# Gemini 최신 모델
+# 문제가 발생하면 아래 순서대로 자동 fallback
+GEMINI_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+]
+
+# Yahoo Finance 서버 fallback
+YAHOO_HOSTS = [
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",
+]
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 # ============================================================
-# 기본 유틸
+# 후보군
+# ============================================================
+#
+# 대형주 + 중형주 + 소형주를 섞는다.
+#
+# 지나치게 많은 종목을 한꺼번에 조회하면 Yahoo rate limit에
+# 걸릴 가능성이 있기 때문에 적절한 후보군으로 제한한다.
 # ============================================================
 
+STOCKS = {
+
+    # ----------------------------
+    # AI / 반도체 대형
+    # ----------------------------
+    "NVDA": "AI 반도체",
+    "AMD": "AI 반도체",
+    "AVGO": "AI 네트워크/반도체",
+    "TSM": "파운드리",
+    "ASML": "반도체 장비",
+    "AMAT": "반도체 장비",
+    "LRCX": "반도체 장비",
+    "MU": "메모리/HBM",
+    "INTC": "반도체",
+
+    # ----------------------------
+    # AI / 데이터센터
+    # ----------------------------
+    "CRWV": "AI 데이터센터",
+    "NBIS": "AI 데이터센터",
+    "IREN": "AI 데이터센터/채굴",
+    "SMCI": "AI 서버",
+    "ANET": "AI 네트워크",
+
+    # ----------------------------
+    # 성장주
+    # ----------------------------
+    "PLTR": "AI 소프트웨어",
+    "TEM": "AI 헬스케어",
+    "APP": "AI/광고",
+    "ARM": "반도체 설계",
+    "RDDT": "플랫폼",
+    "HOOD": "핀테크",
+    "SOFI": "핀테크",
+
+    # ----------------------------
+    # 우주/방산/신성장
+    # ----------------------------
+    "LUNR": "우주",
+    "RKLB": "우주",
+    "ASTS": "위성통신",
+    "RDW": "우주",
+
+    # ----------------------------
+    # 고변동 성장주
+    # ----------------------------
+    "SOUN": "AI 음성",
+    "BBAI": "AI",
+    "AI": "AI 소프트웨어",
+    "IONQ": "양자컴퓨팅",
+    "RGTI": "양자컴퓨팅",
+    "QBTS": "양자컴퓨팅",
+    "HIMS": "디지털 헬스",
+    "RKLB": "우주",
+
+    # ----------------------------
+    # 전기차/로봇
+    # ----------------------------
+    "TSLA": "전기차/AI",
+    "RIVN": "전기차",
+    "LCID": "전기차",
+    "SERV": "로봇",
+}
+
+
+# 중복 제거
+STOCKS = dict(STOCKS)
+
+
+# ============================================================
+# HTTP Session
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+
+# ============================================================
+# 유틸
+# ============================================================
+
+def now_kst():
+    return datetime.now(KST)
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def format_money(value):
+    if value is None:
+        return "N/A"
+
+    try:
+        value = float(value)
+
+        if value >= 1000:
+            return f"${value:,.2f}"
+
+        return f"${value:.2f}"
+
+    except Exception:
+        return "N/A"
+
+
+# ============================================================
+# Yahoo Finance 데이터
+# ============================================================
+
+def yahoo_chart(symbol, range_value="5d", interval="1d"):
+    """
+    Yahoo Finance Chart API.
+
+    query1 실패 -> query2 자동 fallback
+    """
+
+    encoded_symbol = quote(symbol, safe="")
+
+    last_error = None
+
+    for host in YAHOO_HOSTS:
+
+        url = (
+            f"https://{host}/v8/finance/chart/"
+            f"{encoded_symbol}"
+        )
+
+        params = {
+            "range": range_value,
+            "interval": interval,
+            "includePrePost": "true",
+            "events": "div,splits",
+        }
+
+        try:
+
+            response = session.get(
+                url,
+                params=params,
+                timeout=15,
+            )
+
+            if response.status_code != 200:
+                last_error = (
+                    f"{host} HTTP {response.status_code}"
+                )
+                continue
+
+            data = response.json()
+
+            chart = data.get("chart", {})
+
+            result = chart.get("result")
+
+            if not result:
+                error = chart.get("error")
+
+                if error:
+                    last_error = str(error)
+
+                continue
+
+            return result[0]
+
+        except Exception as e:
+
+            last_error = f"{host}: {e}"
+
+            continue
+
+    raise RuntimeError(
+        f"{symbol} Yahoo 데이터 수집 실패: {last_error}"
+    )
+
+
+# ============================================================
+# 종목 분석
+# ============================================================
+
+def analyze_stock(symbol, category):
+
+    try:
+
+        data = yahoo_chart(
+            symbol,
+            range_value="1mo",
+            interval="1d",
+        )
+
+        meta = data.get("meta", {})
+
+        price = safe_float(
+            meta.get("regularMarketPrice")
+        )
+
+        if price <= 0:
+            price = safe_float(
+                meta.get("previousClose")
+            )
+
+        timestamps = data.get("timestamp", [])
+        indicators = data.get(
+            "indicators",
+            {}
+        )
+
+        quote_data = (
+            indicators
+            .get("quote", [{}])[0]
+        )
+
+        closes = quote_data.get(
+            "close",
+            []
+        )
+
+        volumes = quote_data.get(
+            "volume",
+            []
+        )
+
+        closes = [
+            safe_float(x)
+            for x in closes
+            if x is not None
+        ]
+
+        volumes = [
+            safe_float(x)
+            for x in volumes
+            if x is not None
+        ]
+
+        if len(closes) < 2:
+
+            return None
+
+        previous_close = closes[-2]
+
+        if previous_close <= 0:
+            daily_change = 0
+        else:
+            daily_change = (
+                (price - previous_close)
+                / previous_close
+            ) * 100
+
+        # ----------------------------
+        # 5일 변화
+        # ----------------------------
+
+        if len(closes) >= 6:
+
+            old_5d = closes[-6]
+
+            if old_5d > 0:
+
+                weekly_change = (
+                    (price - old_5d)
+                    / old_5d
+                ) * 100
+
+            else:
+                weekly_change = 0
+
+        else:
+
+            weekly_change = 0
+
+        # ----------------------------
+        # 거래량 배수
+        # ----------------------------
+
+        volume_ratio = 1.0
+
+        if len(volumes) >= 6:
+
+            recent_volume = volumes[-1]
+
+            historical_volumes = volumes[-6:-1]
+
+            valid_volumes = [
+                x for x in historical_volumes
+                if x > 0
+            ]
+
+            if valid_volumes:
+
+                avg_volume = (
+                    sum(valid_volumes)
+                    / len(valid_volumes)
+                )
+
+                if avg_volume > 0:
+
+                    volume_ratio = (
+                        recent_volume
+                        / avg_volume
+                    )
+
+        # ----------------------------
+        # 20일 고점 대비
+        # ----------------------------
+
+        high_20 = max(closes[-20:])
+
+        if high_20 > 0:
+
+            drawdown_from_high = (
+                (price - high_20)
+                / high_20
+            ) * 100
+
+        else:
+
+            drawdown_from_high = 0
+
+        # ----------------------------
+        # 기본 점수
+        # ----------------------------
+
+        score = 50.0
+
+        # 거래량 증가
+        if volume_ratio >= 3:
+            score += 20
+
+        elif volume_ratio >= 2:
+            score += 15
+
+        elif volume_ratio >= 1.5:
+            score += 10
+
+        elif volume_ratio >= 1.2:
+            score += 5
+
+        # 일간 상승
+        if 3 <= daily_change <= 12:
+            score += 10
+
+        elif 1 <= daily_change < 3:
+            score += 5
+
+        # 주간 모멘텀
+        if 5 <= weekly_change <= 20:
+            score += 10
+
+        elif weekly_change > 20:
+            score += 5
+
+        # 너무 과도하게 오른 종목은 감점
+        if daily_change > 20:
+            score -= 10
+
+        if daily_change > 35:
+            score -= 15
+
+        # 고점 대비 조정 후 반등 가능성
+        if -25 <= drawdown_from_high <= -5:
+            score += 5
+
+        # 거래량이 너무 낮으면 감점
+        if volume_ratio < 0.7:
+            score -= 5
+
+        score = clamp(score, 0, 100)
+
+        # ----------------------------
+        # 상태
+        # ----------------------------
+
+        if score >= 80:
+            status = "🔥 강한 관심"
+
+        elif score >= 70:
+            status = "🚀 급등 관심"
+
+        elif score >= 60:
+            status = "🔄 반등 관심"
+
+        elif score >= 50:
+            status = "🔎 관찰"
+
+        else:
+            status = "⚠️ 주의"
+
+        return {
+            "symbol": symbol,
+            "category": category,
+            "price": price,
+            "daily_change": daily_change,
+            "weekly_change": weekly_change,
+            "volume_ratio": volume_ratio,
+            "drawdown": drawdown_from_high,
+            "score": score,
+            "status": status,
+        }
+
+    except Exception as e:
+
+        print(
+            f"[시장데이터 오류] {symbol}: {e}"
+        )
+
+        return None
+
+
+# ============================================================
+# 시장 데이터 수집
+# ============================================================
+
+def collect_market_data():
+
+    results = []
+
+    failed = []
+
+    print(
+        f"[{now_kst().strftime('%Y-%m-%d %H:%M:%S')}] "
+        "시장 데이터 수집 시작"
+    )
+
+    for symbol, category in STOCKS.items():
+
+        result = analyze_stock(
+            symbol,
+            category
+        )
+
+        if result:
+
+            results.append(result)
+
+        else:
+
+            failed.append(symbol)
+
+        # Yahoo rate limit 방지
+        time.sleep(0.15)
+
+    print(
+        f"수집 성공: {len(results)}개"
+    )
+
+    print(
+        f"수집 실패: {len(failed)}개"
+    )
+
+    if failed:
+
+        print(
+            "실패 종목:",
+            ", ".join(failed)
+        )
+
+    return results
+
+
+# ============================================================
+# 상위 10개 선정
+# ============================================================
+
+def select_top10(results):
+
+    if not results:
+        return []
+
+    # 점수 우선
+    sorted_results = sorted(
+        results,
+        key=lambda x: (
+            x["score"],
+            x["volume_ratio"],
+            x["weekly_change"]
+        ),
+        reverse=True
+    )
+
+    return sorted_results[:10]
+
+
+# ============================================================
+# Gemini Prompt
+# ============================================================
+
+def build_gemini_prompt(top10):
+
+    market_text = ""
+
+    for i, item in enumerate(top10, 1):
+
+        market_text += f"""
+{i}.
+종목: {item['symbol']}
+분야: {item['category']}
+현재가: {format_money(item['price'])}
+일간 변화: {item['daily_change']:.2f}%
+주간 변화: {item['weekly_change']:.2f}%
+거래량 배수: {item['volume_ratio']:.2f}배
+20일 고점 대비: {item['drawdown']:.2f}%
+자동 데이터 점수: {item['score']:.1f}/100
+"""
+
+
+    prompt = f"""
+당신은 미국 주식 시장을 분석하는
+시니어 주식 전략 분석가다.
+
+아래 종목은 실제 시장 데이터 수집 단계에서
+확인된 후보들이다.
+
+절대로 존재하지 않는 뉴스,
+주가,
+실적,
+거래량,
+공시,
+기관 매수,
+Google Trends,
+GitHub 활동을 만들어내지 마라.
+
+확인할 수 없는 정보는
+반드시 "확인되지 않음"이라고 표시하라.
+
+========================
+분석 목표
+========================
+
+오늘 향후 24~48시간 동안
+상대적으로 반등 가능성이 높은
+미국 주식 TOP 10을 분석한다.
+
+대형주뿐 아니라
+중형주와 소형주도 평가한다.
+
+단,
+소형주라고 해서 무조건 높은 점수를 주지 마라.
+
+========================
+아이디어 1
+========================
+
+GitHub 개발활동 가속도와
+Google 검색 관심도의 시간차 다이버전스를
+분석 관점으로 사용한다.
+
+실제 데이터가 제공되지 않았다면
+추측하지 말고
+"GitHub/Google Trends 검증 데이터 없음"이라고 표시한다.
+
+========================
+아이디어 2
+========================
+
+GitHub 보안 취약점,
+exploit,
+emergency,
+unauthorized,
+overflow,
+rollback 등의 위험 신호가
+실제로 확인되는 경우에만
+급락 위험을 높인다.
+
+확인되지 않은 경우
+해당 내용을 만들어내지 마라.
+
+========================
+아이디어 3
+========================
+
+개발자 유입,
+GitHub contributor,
+star,
+fork,
+watch 증가 등의 신호가
+실제 확인되는 경우에만 반영한다.
+
+========================
+아이디어 4
+========================
+
+인위적인 hype,
+과도한 뉴스 노출,
+실제 기술활동 부족 여부를 평가한다.
+
+확인되지 않은 경우
+판단 보류한다.
+
+========================
+아이디어 5
+========================
+
+개발팀 갈등,
+fork,
+abandon,
+scam,
+proposal rejected 등의
+실제 위험 신호가 확인되는 경우
+급락 위험을 높인다.
+
+========================
+아이디어 6
+========================
+
+신규 release,
+업그레이드,
+신제품,
+상장,
+실적,
+파트너십 등의 촉매를 분석한다.
+
+실제 확인된 자료가 없는 경우
+추측하지 않는다.
+
+========================
+아이디어 7
+========================
+
+보안/코드 위험 신호가 실제로
+확인되는 경우 급락 위험을 평가한다.
+
+========================
+아이디어 8
+========================
+
+개발자 이탈,
+활동 감소,
+프로젝트 ghosting을
+실제 데이터가 있을 경우 평가한다.
+
+========================
+아이디어 9
+========================
+
+악재로 급락했지만
+실제 문제가 해결되었거나
+과매도 후 반등 조건이 발생한 경우
+역발상 반등 후보로 평가한다.
+
+========================
+아이디어 10
+========================
+
+두 개의 가상 분석가를 활용한다.
+
+Agent A:
+기술적/개발활동/시장 데이터 관점
+
+Agent B:
+뉴스/대중심리/시장심리 관점
+
+두 관점이 일치할 때
+신뢰도를 높인다.
+
+단,
+실제 뉴스/Google Trends 데이터가
+제공되지 않은 경우
+그 부분을 사실처럼 표현하지 않는다.
+
+========================
+중요한 분석 원칙
+========================
+
+1. 가격 상승률만 보고 추천하지 않는다.
+
+2. 거래량 증가와 가격 움직임을 함께 본다.
+
+3. 이미 하루에 30~40% 이상 폭등한 종목은
+추격매수 위험을 명확하게 표시한다.
+
+4. 반등 가능성과 급등 가능성을 구분한다.
+
+5. 소형주는 변동성이 높기 때문에
+급락 위험도 함께 평가한다.
+
+6. "성공확률"이라는 표현은
+통계적으로 검증된 확률이 아니라
+현재 데이터에 기반한
+전략적 신뢰도 점수로 표현한다.
+
+7. 데이터가 부족하면
+"판단 보류"라고 한다.
+
+8. 투자자에게 특정 가격에서
+무조건 매수하라고 명령하지 않는다.
+
+========================
+출력 형식
+========================
+
+아래 형식을 반드시 따른다.
+
+📊 미국 주식 전략 레이더
+
+1️⃣ 종목명 / 티커
+분야:
+현재가:
+일간:
+주간:
+거래량:
+데이터 점수:
+
+🔥 전략 판단:
+[급등관심 / 반등관심 / 관찰 / 급락주의]
+
+📈 반등 가능성:
+[높음 / 중간 / 낮음]
+
+⚠️ 급락 위험:
+[높음 / 중간 / 낮음]
+
+🎯 핵심 이유:
+최대 2줄
+
+🚀 상승 촉매:
+확인된 내용만
+
+⚠️ 위험 요인:
+확인된 내용만
+
+🔬 검증 상태:
+[시장데이터 확인]
+[뉴스 확인 여부]
+[GitHub 확인 여부]
+[Google Trends 확인 여부]
+
+------------------------
+
+마지막에
+
+🏆 오늘의 TOP 3
+
+1.
+2.
+3.
+
+🔥 가장 공격적인 후보
+1개
+
+🛡 가장 안정적인 후보
+1개
+
+⚠️ 가장 주의해야 할 후보
+1개
+
+그리고
+
+"AI 검증 신뢰도"
+
+를 표시한다.
+
+시장 데이터만 있고
+뉴스/GitHub/Google Trends가 없으면
+신뢰도를 낮게 표시한다.
+
+========================
+
+실제 시장 데이터
+========================
+
+{market_text}
+"""
+
+    return prompt
+
+
+# ============================================================
+# Gemini Interactions API
+# ============================================================
+
+def call_gemini(prompt):
+
+    if not GEMINI_API_KEY:
+
+        return None, "GEMINI_API_KEY 없음"
+
+    # 최신 모델부터 시도
+    for model in GEMINI_MODELS:
+
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/interactions"
+        )
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        }
+
+        payload = {
+            "model": model,
+            "input": prompt,
+        }
+
+        try:
+
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+
+            # 성공
+            if response.status_code == 200:
+
+                data = response.json()
+
+                # Interactions API 응답에서 text 찾기
+                text = extract_interaction_text(data)
+
+                if text:
+
+                    return text, None
+
+                return None, (
+                    "Gemini 응답은 성공했지만 "
+                    "텍스트를 찾지 못했습니다."
+                )
+
+            # quota
+            if response.status_code == 429:
+
+                print(
+                    f"Gemini 429: {model}"
+                )
+
+                # 다음 모델로 시도
+                continue
+
+            # model not found
+            if response.status_code == 404:
+
+                print(
+                    f"Gemini 404: {model}"
+                )
+
+                continue
+
+            print(
+                f"Gemini 오류 {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"Gemini 요청 오류: {e}"
+            )
+
+    return None, (
+        "Gemini 최신정보 검증 실패"
+    )
+
+
+# ============================================================
+# Gemini 응답 파싱
+# ============================================================
+
+def extract_interaction_text(data):
+
+    # 가장 흔한 형태
+    if isinstance(data.get("output"), str):
+
+        return data["output"]
+
+    output = data.get("output")
+
+    if isinstance(output, list):
+
+        texts = []
+
+        for item in output:
+
+            if not isinstance(item, dict):
+                continue
+
+            # content
+            content = item.get("content")
+
+            if isinstance(content, list):
+
+                for c in content:
+
+                    if isinstance(c, dict):
+
+                        text = c.get("text")
+
+                        if text:
+                            texts.append(text)
+
+            # 직접 text
+            text = item.get("text")
+
+            if text:
+                texts.append(text)
+
+        if texts:
+
+            return "\n".join(texts)
+
+    # fallback
+    response = data.get("response")
+
+    if isinstance(response, str):
+
+        return response
+
+    return None
+
+
+# ============================================================
+# Gemini 실패 시 데이터 기반 메시지
+# ============================================================
+
+def create_fallback_report(top10):
+
+    if not top10:
+
+        return (
+            "🚨 미국 주식 전략 레이더\n\n"
+            "시장 데이터를 수집하지 못했습니다.\n"
+            "다음 실행 주기에 다시 시도합니다."
+        )
+
+    now = now_kst().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    text = []
+
+    text.append(
+        "🚨 미국 주식 전략 레이더"
+    )
+
+    text.append(
+        f"\n⏰ {now} KST"
+    )
+
+    text.append(
+        "\n⚠️ Gemini AI 검증은 현재 사용할 수 없습니다."
+    )
+
+    text.append(
+        "\n아래 내용은 실제 시장 가격/거래량을 "
+        "기반으로 계산한 자동 데이터 점수입니다."
+    )
+
+    text.append(
+        "\n※ AI가 확인하지 못한 뉴스나 재료를 "
+        "임의로 생성하지 않습니다."
+    )
+
+    text.append(
+        "\n━━━━━━━━━━━━━━"
+    )
+
+    for i, item in enumerate(top10, 1):
+
+        text.append(
+            f"\n{i}️⃣ {item['symbol']} "
+            f"({item['category']})"
+        )
+
+        text.append(
+            f"\n현재가: {format_money(item['price'])}"
+        )
+
+        text.append(
+            f"\n일간: {item['daily_change']:+.2f}%"
+        )
+
+        text.append(
+            f"\n주간: {item['weekly_change']:+.2f}%"
+        )
+
+        text.append(
+            f"\n거래량: {item['volume_ratio']:.2f}배"
+        )
+
+        text.append(
+            f"\n데이터 점수: "
+            f"{item['score']:.1f}/100"
+        )
+
+        text.append(
+            f"\n상태: {item['status']}"
+        )
+
+    text.append(
+        "\n━━━━━━━━━━━━━━"
+    )
+
+    text.append(
+        "\nGemini 상태"
+    )
+
+    text.append(
+        "\n최신 뉴스/재료/GitHub/Google Trends "
+        "교차검증을 완료하지 못했습니다."
+    )
+
+    text.append(
+        "\n따라서 급등 확률이나 성공 확률을 "
+        "임의로 생성하지 않았습니다."
+    )
+
+    return "\n".join(text)
+
+
+# ============================================================
+# 텔레그램 메시지 분할
+# ============================================================
+
+def send_telegram(text):
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        print(
+            "TELEGRAM_BOT_TOKEN 없음"
+        )
+
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+
+        print(
+            "TELEGRAM_CHAT_ID 없음"
+        )
+
+        return False
+
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    # Telegram 메시지 길이 제한 대비
+    max_length = 3900
+
+    chunks = [
+        text[i:i + max_length]
+        for i in range(
+            0,
+            len(text),
+            max_length
+        )
+    ]
+
+    success = True
+
+    for chunk in chunks:
+
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+        }
+
+        try:
+
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=15,
+            )
+
+            if response.status_code != 200:
+
+                print(
+                    "Telegram 오류:",
+                    response.text[:500]
+                )
+
+                success = False
+
+        except Exception as e:
+
+            print(
+                "Telegram 요청 오류:",
+                e
+            )
+
+            success = False
+
+        time.sleep(0.5)
+
+    return success
+
+
+# ============================================================
+# 메인
+# ============================================================
+
+def main():
+
+    print("=" * 60)
+
+    print(
+        "미국 주식 전략 레이더 시작"
+    )
+
+    print(
+        now_kst().strftime(
+            "%Y-%m-%d %H:%M:%S KST"
+        )
+    )
+
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # 1. 시장 데이터
+    # --------------------------------------------------------
+
+    results = collect_market_data()
+
+    # --------------------------------------------------------
+    # 2. 데이터가 일부라도 있으면 계속 진행
+    # --------------------------------------------------------
+
+    if not results:
+
+        report = (
+            "🚨 미국 주식 전략 레이더\n\n"
+            "시장 데이터를 수집하지 못했습니다.\n\n"
+            "Yahoo Finance 데이터 서버의 "
+            "일시적 오류 또는 네트워크 오류일 수 있습니다.\n\n"
+            "다음 실행 주기에 자동 재시도합니다."
+        )
+
+        send_telegram(report)
+
+        return
+
+    # --------------------------------------------------------
+    # 3. TOP 10
+    # --------------------------------------------------------
+
+    top10 = select_top10(results)
+
+    # --------------------------------------------------------
+    # 4. Gemini 분석
+    # --------------------------------------------------------
+
+    gemini_text = None
+    gemini_error = None
+
+    if GEMINI_API_KEY:
+
+        prompt = build_gemini_prompt(
+            top10
+        )
+
+        print(
+            "Gemini AI 분석 시작..."
+        )
+
+        gemini_text, gemini_error = (
+            call_gemini(prompt)
+        )
+
+    else:
+
+        gemini_error = (
+            "GEMINI_API_KEY가 설정되지 않았습니다."
+        )
+
+    # --------------------------------------------------------
+    # 5. Gemini 성공
+    # --------------------------------------------------------
+
+    if gemini_text:
+
+        report = (
+            "🚨 미국 주식 전략 레이더\n\n"
+            + gemini_text
+        )
+
+    # --------------------------------------------------------
+    # 6. Gemini 실패
+    # --------------------------------------------------------
+
+    else:
+
+        print(
+            "Gemini 분석 실패:",
+            gemini_error
+        )
+
+        report = create_fallback_report(
+            top10
+        )
+
+    # --------------------------------------------------------
+    # 7. Telegram
+    # --------------------------------------------------------
+
+    print(
+        "Telegram 전송 시작..."
+    )
+
+    telegram_success = send_telegram(
+        report
+    )
+
+    if telegram_success:
+
+        print(
+            "Telegram 전송 성공"
+        )
+
+    else:
+
+        print(
+            "Telegram 전송 실패"
+        )
+
+    print("=" * 60)
+
+    print("프로그램 종료")
+
+
+# ============================================================
+# 실행
+# ============================================================
+
+if __name__ == "__main__":
+    main()
 def now_kst():
     return datetime.now(KST)
 
