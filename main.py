@@ -1,1723 +1,1665 @@
 import os
-import time
-import math
 import json
-import html
+import time
 import requests
-import feedparser
-import yfinance as yf
-
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
+
+# ============================================================
+# 미국 주식 전략 레이더
+# Gemini + Google Search + Yahoo Finance + GitHub + Telegram
+#
+# 실행:
+# GitHub Actions에서 1시간마다 실행
+#
+# 필요한 GitHub Secrets:
+#
+# GEMINI_API_KEY
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_CHAT_ID
+#
+# 선택:
+# GITHUB_TOKEN
+#
+# ============================================================
 
 
-# =========================================================
+# ============================================================
 # 환경변수
-# =========================================================
+# ============================================================
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-
-# 선택사항
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 
-# Gemini 모델
-# 현재 안정적인 2.5 Flash 사용
-GEMINI_MODEL = os.environ.get(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash"
-).strip()
 
-
-# =========================================================
+# ============================================================
 # 기본 설정
-# =========================================================
+# ============================================================
 
 KST = timezone(timedelta(hours=9))
 
-REQUEST_TIMEOUT = 15
+# Google이 현재 권장하는 최신 Flash 계열
+GEMINI_MODEL = "gemini-3.6-flash"
 
+# 최대 분석 종목
+MAX_CANDIDATES = 40
+
+# 최종 추천
 TOP_N = 10
 
-# Gemini에 넘길 후보 수
-AI_CANDIDATES = 25
-
-
-# =========================================================
-# 분석 대상
-#
-# 대형주 + 중형주 + 소형주를 일부러 섞음
-# =========================================================
-
-TICKERS = [
-
-    # -------------------------
-    # AI / 반도체 대형
-    # -------------------------
-
-    "NVDA",
-    "AMD",
-    "AVGO",
-    "TSM",
-    "MU",
-    "AMAT",
-    "LRCX",
-    "MRVL",
-    "ARM",
-    "ASML",
-    "INTC",
-    "QCOM",
-    "SMCI",
-    "ANET",
-
-    # -------------------------
-    # 빅테크
-    # -------------------------
-
-    "MSFT",
-    "GOOGL",
-    "META",
-    "AMZN",
-    "AAPL",
-    "TSLA",
-    "NFLX",
-
-    # -------------------------
-    # AI / 데이터 / 성장
-    # -------------------------
-
-    "PLTR",
-    "CRWV",
-    "TEM",
-    "NBIS",
-    "IREN",
-    "HIMS",
-    "RDDT",
-
-    # -------------------------
-    # 우주 / 방산 / 미래산업
-    # -------------------------
-
-    "RKLB",
-    "ASTS",
-    "LUNR",
-    "ACHR",
-    "JOBY",
-    "OKLO",
-
-    # -------------------------
-    # AI 소형주 / 고변동
-    # -------------------------
-
-    "SOUN",
-    "BBAI",
-    "AI",
-    "VERI",
-    "BIGB",
-
-    # -------------------------
-    # 양자컴퓨팅
-    # -------------------------
-
-    "IONQ",
-    "RGTI",
-    "QBTS",
-    "QUBT",
-
-    # -------------------------
-    # 바이오 / 헬스
-    # -------------------------
-
-    "CRSP",
-    "RXRX",
-    "BEAM",
-    "EDIT",
-
-    # -------------------------
-    # 기타 성장주
-    # -------------------------
-
-    "CELH",
-    "SOFI",
-    "HOOD",
-    "NU",
-    "AFRM",
-    "UPST",
-    "CVNA",
-    "MARA",
-    "CLSK",
-    "RIOT",
-
-]
-
-
-# =========================================================
-# 분야
-# =========================================================
-
-SECTOR_MAP = {
-
-    "NVDA": "AI/반도체",
-    "AMD": "AI/반도체",
-    "AVGO": "AI/반도체",
-    "TSM": "반도체",
-    "MU": "메모리/HBM",
-    "AMAT": "반도체장비",
-    "LRCX": "반도체장비",
-    "MRVL": "AI 네트워크",
-    "ARM": "반도체/CPU",
-    "ASML": "반도체장비",
-    "INTC": "반도체",
-    "QCOM": "반도체",
-    "SMCI": "AI 서버",
-    "ANET": "AI 네트워크",
-
-    "MSFT": "빅테크/AI",
-    "GOOGL": "빅테크/AI",
-    "META": "빅테크/AI",
-    "AMZN": "빅테크/AI",
-    "AAPL": "빅테크",
-    "TSLA": "전기차/AI",
-    "NFLX": "미디어",
-
-    "PLTR": "AI/데이터",
-    "CRWV": "AI 데이터센터",
-    "TEM": "AI 헬스케어",
-    "NBIS": "AI 데이터센터",
-    "IREN": "AI 데이터센터/채굴",
-    "HIMS": "헬스케어",
-    "RDDT": "소셜/AI",
-
-    "RKLB": "우주",
-    "ASTS": "우주",
-    "LUNR": "우주",
-    "ACHR": "UAM",
-    "JOBY": "UAM",
-    "OKLO": "원자력",
-
-    "SOUN": "AI 음성",
-    "BBAI": "AI",
-    "AI": "AI",
-    "VERI": "AI",
-    "BIGB": "AI",
-
-    "IONQ": "양자컴퓨팅",
-    "RGTI": "양자컴퓨팅",
-    "QBTS": "양자컴퓨팅",
-    "QUBT": "양자컴퓨팅",
-
-    "CRSP": "바이오",
-    "RXRX": "AI 바이오",
-    "BEAM": "바이오",
-    "EDIT": "바이오",
-
-    "CELH": "소비재",
-    "SOFI": "핀테크",
-    "HOOD": "핀테크",
-    "NU": "핀테크",
-    "AFRM": "핀테크",
-    "UPST": "핀테크",
-    "CVNA": "자동차",
-    "MARA": "크립토/채굴",
-    "CLSK": "크립토/채굴",
-    "RIOT": "크립토/채굴",
+# Yahoo Finance
+YAHOO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/120 Safari/537.36"
+    )
 }
 
 
-# =========================================================
-# 공통
-# =========================================================
+# ============================================================
+# 시간
+# ============================================================
 
 def now_kst():
     return datetime.now(KST)
 
 
-def safe_float(value, default=0.0):
+def time_text():
+    return now_kst().strftime("%Y-%m-%d %H:%M:%S KST")
+
+
+# ============================================================
+# Telegram
+# ============================================================
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram 설정이 없습니다.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    # Telegram 메시지 최대 길이 대비
+    chunks = []
+
+    while len(message) > 3900:
+        cut = message.rfind("\n", 0, 3900)
+
+        if cut < 1000:
+            cut = 3900
+
+        chunks.append(message[:cut])
+        message = message[cut:]
+
+    chunks.append(message)
+
+    success = True
+
+    for chunk in chunks:
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": chunk
+                },
+                timeout=15
+            )
+
+            if response.status_code != 200:
+                print("Telegram 오류:", response.text)
+                success = False
+
+        except Exception as e:
+            print("Telegram 전송 오류:", e)
+            success = False
+
+    return success
+
+
+# ============================================================
+# Yahoo Finance
+# ============================================================
+
+def yahoo_quote(symbol):
+    """
+    Yahoo Finance chart API에서
+    최근 가격 / 거래량 / 기간 수익률을 가져옵니다.
+    """
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{symbol}?range=1mo&interval=1d"
+    )
+
+    try:
+        r = requests.get(
+            url,
+            headers=YAHOO_HEADERS,
+            timeout=15
+        )
+
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+
+        result = data.get("chart", {}).get("result")
+
+        if not result:
+            return None
+
+        result = result[0]
+
+        meta = result.get("meta", {})
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
+
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+
+        closes = [
+            float(x) for x in closes
+            if x is not None
+        ]
+
+        volumes = [
+            float(x) for x in volumes
+            if x is not None
+        ]
+
+        if len(closes) < 2:
+            return None
+
+        price = meta.get("regularMarketPrice")
+
+        if price is None:
+            price = closes[-1]
+
+        price = float(price)
+
+        # 일간
+        daily_change = 0
+
+        if len(closes) >= 2 and closes[-2] != 0:
+            daily_change = (
+                (closes[-1] / closes[-2]) - 1
+            ) * 100
+
+        # 5거래일
+        weekly_change = 0
+
+        if len(closes) >= 6 and closes[-6] != 0:
+            weekly_change = (
+                (closes[-1] / closes[-6]) - 1
+            ) * 100
+
+        # 20거래일
+        monthly_change = 0
+
+        if len(closes) >= 21 and closes[-21] != 0:
+            monthly_change = (
+                (closes[-1] / closes[-21]) - 1
+            ) * 100
+
+        volume_ratio = 1
+
+        if len(volumes) >= 21:
+
+            recent_volume = volumes[-1]
+
+            previous_volumes = volumes[-21:-1]
+
+            previous_volumes = [
+                x for x in previous_volumes
+                if x > 0
+            ]
+
+            if previous_volumes:
+
+                avg_volume = (
+                    sum(previous_volumes)
+                    / len(previous_volumes)
+                )
+
+                if avg_volume > 0:
+                    volume_ratio = (
+                        recent_volume / avg_volume
+                    )
+
+        return {
+            "symbol": symbol,
+            "price": price,
+            "daily_change": daily_change,
+            "weekly_change": weekly_change,
+            "monthly_change": monthly_change,
+            "volume_ratio": volume_ratio
+        }
+
+    except Exception as e:
+
+        print(f"Yahoo 오류 {symbol}:", e)
+
+        return None
+
+
+# ============================================================
+# GitHub
+# ============================================================
+
+def github_headers():
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "stock-strategy-radar"
+    }
+
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+    return headers
+
+
+def github_search_repositories(keyword):
+
+    url = "https://api.github.com/search/repositories"
+
+    params = {
+        "q": keyword,
+        "sort": "stars",
+        "order": "desc",
+        "per_page": 5
+    }
 
     try:
 
-        if value is None:
-            return default
+        r = requests.get(
+            url,
+            headers=github_headers(),
+            params=params,
+            timeout=15
+        )
 
-        if isinstance(value, float) and math.isnan(value):
-            return default
+        if r.status_code != 200:
+            return []
 
-        return float(value)
+        data = r.json()
 
-    except Exception:
+        return data.get("items", [])
 
-        return default
+    except Exception as e:
+
+        print("GitHub 검색 오류:", e)
+
+        return []
 
 
-def clamp(value, low=0, high=100):
+def github_repo_activity(repo):
 
-    return max(low, min(high, value))
+    """
+    프로젝트의 개발활동을 간단하게 평가합니다.
+    """
 
+    full_name = repo.get("full_name")
 
-# =========================================================
-# Telegram
-# =========================================================
-
-def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-
-        print("Telegram 환경변수가 없습니다.")
-
-        return False
+    if not full_name:
+        return None
 
     url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        f"https://api.github.com/repos/"
+        f"{full_name}/commits"
     )
 
+    params = {
+        "per_page": 30
+    }
+
+    try:
+
+        r = requests.get(
+            url,
+            headers=github_headers(),
+            params=params,
+            timeout=15
+        )
+
+        if r.status_code != 200:
+            return None
+
+        commits = r.json()
+
+        return {
+            "repo": full_name,
+            "stars": repo.get("stargazers_count", 0),
+            "forks": repo.get("forks_count", 0),
+            "open_issues": repo.get("open_issues_count", 0),
+            "recent_commits": len(commits)
+        }
+
+    except Exception as e:
+
+        print("GitHub activity 오류:", e)
+
+        return None
+
+
+# ============================================================
+# 종목 후보군
+# ============================================================
+
+def build_stock_universe():
+
+    """
+    대형주만 고르지 않도록
+    대형 / 중형 / 소형 / AI / 반도체 / 우주 / 핀테크
+    등을 혼합합니다.
+
+    아래 종목들은 '분석 후보군'입니다.
+    최종 추천은 데이터와 Gemini 검증 후 결정합니다.
+    """
+
+    symbols = [
+
+        # -----------------------
+        # 대형 AI / 반도체
+        # -----------------------
+
+        "NVDA",
+        "AMD",
+        "AVGO",
+        "TSM",
+        "MU",
+        "INTC",
+        "QCOM",
+        "AMAT",
+        "LRCX",
+        "ASML",
+        "ANET",
+
+        # -----------------------
+        # AI / 데이터센터
+        # -----------------------
+
+        "CRWV",
+        "NBIS",
+        "IREN",
+        "SMCI",
+        "VRT",
+        "EQIX",
+        "DLR",
+        "CIFR",
+        "CORZ",
+
+        # -----------------------
+        # 성장주
+        # -----------------------
+
+        "PLTR",
+        "TEM",
+        "SOUN",
+        "AI",
+        "BBAI",
+        "PATH",
+        "RXRX",
+        "IONQ",
+        "QBTS",
+        "RGTI",
+
+        # -----------------------
+        # 우주
+        # -----------------------
+
+        "LUNR",
+        "RKLB",
+        "ASTS",
+
+        # -----------------------
+        # 전기차 / 미래산업
+        # -----------------------
+
+        "TSLA",
+        "RIVN",
+        "LCID",
+
+        # -----------------------
+        # 핀테크 / 결제
+        # -----------------------
+
+        "SOFI",
+        "HOOD",
+        "AFRM",
+        "NU",
+
+        # -----------------------
+        # 바이오 / 헬스케어
+        # -----------------------
+
+        "CRSP",
+        "EDIT",
+        "BEAM",
+        "VKTX",
+        "HIMS",
+
+        # -----------------------
+        # 에너지
+        # -----------------------
+
+        "OKLO",
+        "SMR",
+        "CEG",
+        "CCJ",
+
+        # -----------------------
+        # 기타
+        # -----------------------
+
+        "MARA",
+        "RIOT",
+        "COIN",
+        "MSTR"
+    ]
+
+    return list(dict.fromkeys(symbols))
+
+
+# ============================================================
+# 기술적 점수
+# ============================================================
+
+def calculate_market_score(data):
+
+    """
+    주가 데이터만으로 0~100 점수를 계산합니다.
+
+    이것은 AI 분석 점수가 아닙니다.
+    """
+
+    score = 0
+
+    daily = data["daily_change"]
+    weekly = data["weekly_change"]
+    monthly = data["monthly_change"]
+    volume = data["volume_ratio"]
+
+    # 거래량
+    if volume >= 3:
+        score += 30
+    elif volume >= 2:
+        score += 25
+    elif volume >= 1.5:
+        score += 20
+    elif volume >= 1.2:
+        score += 10
+
+    # 단기 모멘텀
+    if daily > 15:
+        score += 20
+    elif daily > 8:
+        score += 16
+    elif daily > 3:
+        score += 12
+    elif daily > 0:
+        score += 6
+
+    # 주간 모멘텀
+    if weekly > 20:
+        score += 20
+    elif weekly > 10:
+        score += 15
+    elif weekly > 5:
+        score += 10
+    elif weekly > 0:
+        score += 5
+
+    # 월간 추세
+    if monthly > 30:
+        score += 15
+    elif monthly > 15:
+        score += 12
+    elif monthly > 5:
+        score += 8
+    elif monthly > 0:
+        score += 4
+
+    # 지나치게 오른 종목은 추격 위험
+    if daily >= 30:
+        score -= 10
+
+    if daily >= 50:
+        score -= 15
+
+    return max(0, min(100, score))
+
+
+# ============================================================
+# Gemini Interactions API
+# ============================================================
+
+def gemini_analyze(prompt):
+
+    """
+    Google Gemini Interactions API
+
+    Google Search grounding을 이용하여
+    최신 뉴스/시장 정보를 확인합니다.
+    """
+
+    if not GEMINI_API_KEY:
+
+        return {
+            "success": False,
+            "reason": "GEMINI_API_KEY가 없습니다."
+        }
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        "v1beta/interactions"
+    )
+
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json"
+    }
+
     payload = {
+        "model": GEMINI_MODEL,
+        "input": prompt,
 
-        "chat_id": TELEGRAM_CHAT_ID,
+        "tools": [
+            {
+                "type": "google_search"
+            }
+        ],
 
-        "text": message,
-
-        "disable_web_page_preview": True,
-
+        "store": False
     }
 
     try:
 
         response = requests.post(
             url,
+            headers=headers,
             json=payload,
-            timeout=REQUEST_TIMEOUT
+            timeout=90
         )
 
         print(
-            "Telegram:",
+            "Gemini 상태코드:",
             response.status_code
         )
 
-        return response.status_code == 200
+        # -------------------------
+        # 성공
+        # -------------------------
 
-    except Exception as e:
+        if response.status_code == 200:
 
-        print(
-            "Telegram 오류:",
-            e
-        )
+            data = response.json()
 
-        return False
-
-
-# =========================================================
-# Yahoo Finance
-# =========================================================
-
-def get_stock_data(ticker):
-
-    try:
-
-        stock = yf.Ticker(ticker)
-
-        hist = stock.history(
-            period="3mo",
-            interval="1d",
-            auto_adjust=False
-        )
-
-        if hist.empty or len(hist) < 10:
-
-            return None
-
-        hist = hist.dropna()
-
-        close = safe_float(
-            hist["Close"].iloc[-1]
-        )
-
-        prev_close = safe_float(
-            hist["Close"].iloc[-2]
-        )
-
-        volume = safe_float(
-            hist["Volume"].iloc[-1]
-        )
-
-        avg_volume_20 = safe_float(
-            hist["Volume"].tail(20).mean()
-        )
-
-        volume_ratio = (
-            volume / avg_volume_20
-            if avg_volume_20 > 0
-            else 0
-        )
-
-        day_change = (
-            ((close / prev_close) - 1) * 100
-            if prev_close > 0
-            else 0
-        )
-
-        week_base = safe_float(
-            hist["Close"].iloc[-6]
-        ) if len(hist) >= 6 else close
-
-        month_base = safe_float(
-            hist["Close"].iloc[-22]
-        ) if len(hist) >= 22 else close
-
-        week_change = (
-            ((close / week_base) - 1) * 100
-            if week_base > 0
-            else 0
-        )
-
-        month_change = (
-            ((close / month_base) - 1) * 100
-            if month_base > 0
-            else 0
-        )
-
-        high_3m = safe_float(
-            hist["High"].max()
-        )
-
-        low_3m = safe_float(
-            hist["Low"].min()
-        )
-
-        from_high = (
-            ((close / high_3m) - 1) * 100
-            if high_3m > 0
-            else 0
-        )
-
-        from_low = (
-            ((close / low_3m) - 1) * 100
-            if low_3m > 0
-            else 0
-        )
-
-        # RSI
-        delta = hist["Close"].diff()
-
-        gain = delta.clip(lower=0)
-
-        loss = -delta.clip(upper=0)
-
-        avg_gain = gain.rolling(14).mean().iloc[-1]
-
-        avg_loss = loss.rolling(14).mean().iloc[-1]
-
-        if avg_loss == 0:
-
-            rsi = 100
-
-        else:
-
-            rs = avg_gain / avg_loss
-
-            rsi = 100 - (
-                100 / (1 + rs)
-            )
-
-        # 단기 이동평균
-        ma5 = safe_float(
-            hist["Close"].tail(5).mean()
-        )
-
-        ma20 = safe_float(
-            hist["Close"].tail(20).mean()
-        )
-
-        trend_score = 0
-
-        if close > ma5:
-            trend_score += 5
-
-        if close > ma20:
-            trend_score += 5
-
-        # 반등 점수
-        rebound_score = 0
-
-        if -15 <= from_high <= -3:
-            rebound_score += 10
-
-        if 30 <= rsi <= 55:
-            rebound_score += 10
-
-        if volume_ratio >= 1.3:
-            rebound_score += 10
-
-        if week_change > 0:
-            rebound_score += 5
-
-        # 급등 모멘텀
-        momentum_score = 0
-
-        if day_change > 2:
-            momentum_score += 10
-
-        if week_change > 5:
-            momentum_score += 10
-
-        if volume_ratio >= 2:
-            momentum_score += 10
-
-        # 과열 위험
-        overheat_score = 0
-
-        if rsi >= 75:
-            overheat_score += 20
-
-        if day_change >= 10:
-            overheat_score += 15
-
-        if week_change >= 30:
-            overheat_score += 15
-
-        # 급락 위험
-        crash_score = 0
-
-        if day_change <= -5:
-            crash_score += 15
-
-        if week_change <= -15:
-            crash_score += 15
-
-        if rsi <= 25:
-            crash_score += 10
-
-        info = {}
-
-        try:
-
-            info = stock.info or {}
-
-        except Exception:
-
-            info = {}
-
-        market_cap = safe_float(
-            info.get("marketCap")
-        )
-
-        short_ratio = safe_float(
-            info.get("shortRatio")
-        )
-
-        float_shares = safe_float(
-            info.get("floatShares")
-        )
-
-        shares_outstanding = safe_float(
-            info.get("sharesOutstanding")
-        )
-
-        company_name = (
-            info.get("longName")
-            or info.get("shortName")
-            or ticker
-        )
-
-        return {
-
-            "ticker": ticker,
-
-            "name": company_name,
-
-            "sector": SECTOR_MAP.get(
-                ticker,
-                "기타"
-            ),
-
-            "price": close,
-
-            "day_change": day_change,
-
-            "week_change": week_change,
-
-            "month_change": month_change,
-
-            "volume_ratio": volume_ratio,
-
-            "rsi": rsi,
-
-            "ma5": ma5,
-
-            "ma20": ma20,
-
-            "from_high": from_high,
-
-            "from_low": from_low,
-
-            "market_cap": market_cap,
-
-            "short_ratio": short_ratio,
-
-            "float_shares": float_shares,
-
-            "shares_outstanding": shares_outstanding,
-
-            "trend_score": trend_score,
-
-            "rebound_score": rebound_score,
-
-            "momentum_score": momentum_score,
-
-            "overheat_score": overheat_score,
-
-            "crash_score": crash_score,
-
-        }
-
-    except Exception as e:
-
-        print(
-            f"{ticker} 데이터 오류:",
-            e
-        )
-
-        return None
-
-
-# =========================================================
-# 뉴스
-# =========================================================
-
-def get_news(ticker, company_name):
-
-    try:
-
-        query = quote(
-            f"{ticker} {company_name} stock"
-        )
-
-        url = (
-            "https://news.google.com/rss/search?"
-            f"q={query}"
-            "&hl=en-US"
-            "&gl=US"
-            "&ceid=US:en"
-        )
-
-        response = requests.get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "User-Agent":
-                "Mozilla/5.0"
-            }
-        )
-
-        feed = feedparser.parse(
-            response.content
-        )
-
-        articles = []
-
-        for entry in feed.entries[:5]:
-
-            title = entry.get(
-                "title",
+            output_text = data.get(
+                "output_text",
                 ""
             )
 
-            published = entry.get(
-                "published",
-                ""
-            )
+            if output_text:
 
-            if title:
+                return {
+                    "success": True,
+                    "text": output_text
+                }
 
-                articles.append({
-                    "title": title,
-                    "published": published
-                })
+            # 혹시 output_text가 없는 경우
+            outputs = data.get("outputs", [])
 
-        return articles
+            texts = []
 
-    except Exception as e:
+            for item in outputs:
 
-        print(
-            f"{ticker} 뉴스 오류:",
-            e
-        )
+                if isinstance(item, dict):
 
-        return []
+                    text = item.get("text")
 
+                    if text:
+                        texts.append(text)
 
-# =========================================================
-# GitHub 개발활동
-#
-# 주식회사 자체 GitHub가 있는 경우에 한해 참고지표로 사용
-# =========================================================
+            if texts:
 
-GITHUB_REPOS = {
+                return {
+                    "success": True,
+                    "text": "\n".join(texts)
+                }
 
-    "IONQ": [
-        "ionq/ionq"
-    ],
-
-    "RGTI": [
-        "rigetti/pyquil"
-    ],
-
-    "QBTS": [
-        "dwavesystems/dwave-ocean-sdk"
-    ],
-
-    "QUBT": [
-        "Qunnect/Qunnect"
-    ],
-
-    "PLTR": [
-        "palantir/blueprint"
-    ],
-
-    "RKLB": [
-        "Rocket-Lab"
-    ],
-
-}
-
-
-def github_headers():
-
-    headers = {
-        "Accept":
-        "application/vnd.github+json"
-    }
-
-    if GITHUB_TOKEN:
-
-        headers["Authorization"] = (
-            f"Bearer {GITHUB_TOKEN}"
-        )
-
-    return headers
-
-
-def get_github_activity(ticker):
-
-    repos = GITHUB_REPOS.get(
-        ticker,
-        []
-    )
-
-    if not repos:
-
-        return {
-
-            "available": False,
-
-            "commits_30d": None,
-
-            "issues": None,
-
-            "activity_score": 0,
-
-        }
-
-    total_commits = 0
-
-    total_issues = 0
-
-    for repo in repos:
-
-        try:
-
-            url = (
-                "https://api.github.com/repos/"
-                f"{repo}/commits"
-            )
-
-            params = {
-                "per_page": 30
+            return {
+                "success": False,
+                "reason": "Gemini 응답 내용이 없습니다."
             }
 
-            response = requests.get(
-                url,
-                headers=github_headers(),
-                params=params,
-                timeout=REQUEST_TIMEOUT
-            )
+        # -------------------------
+        # 429
+        # -------------------------
 
-            if response.status_code != 200:
+        if response.status_code == 429:
 
-                continue
-
-            commits = response.json()
-
-            total_commits += len(commits)
-
-        except Exception:
-
-            continue
-
-        try:
-
-            url = (
-                "https://api.github.com/repos/"
-                f"{repo}/issues"
-            )
-
-            params = {
-
-                "state": "open",
-
-                "per_page": 20
-
-            }
-
-            response = requests.get(
-                url,
-                headers=github_headers(),
-                params=params,
-                timeout=REQUEST_TIMEOUT
-            )
-
-            if response.status_code == 200:
-
-                issues = response.json()
-
-                total_issues += len(
-                    [
-                        x for x in issues
-                        if "pull_request" not in x
-                    ]
+            return {
+                "success": False,
+                "quota": True,
+                "reason": (
+                    "Gemini API quota/rate limit에 "
+                    "도달했습니다."
                 )
-
-        except Exception:
-
-            pass
-
-    activity_score = clamp(
-        total_commits * 2
-    )
-
-    return {
-
-        "available": True,
-
-        "commits_30d": total_commits,
-
-        "issues": total_issues,
-
-        "activity_score":
-            activity_score,
-
-    }
-
-
-# =========================================================
-# 후보 종목 사전 점수
-# =========================================================
-
-def calculate_pre_score(data, news_count, github):
-
-    score = 0
-
-    # 가격 모멘텀
-    score += clamp(
-        data["momentum_score"],
-        0,
-        30
-    )
-
-    # 반등 가능성
-    score += clamp(
-        data["rebound_score"],
-        0,
-        25
-    )
-
-    # 추세
-    score += clamp(
-        data["trend_score"],
-        0,
-        10
-    )
-
-    # 거래량
-    if data["volume_ratio"] >= 1.5:
-        score += 10
-
-    elif data["volume_ratio"] >= 1.2:
-        score += 5
-
-    # 뉴스
-    if news_count >= 4:
-        score += 10
-
-    elif news_count >= 2:
-        score += 5
-
-    # GitHub
-    if github.get("available"):
-
-        score += min(
-            10,
-            github.get(
-                "activity_score",
-                0
-            )
-        )
-
-    # 소형주/중소형주 보너스
-    market_cap = data["market_cap"]
-
-    if 0 < market_cap < 2_000_000_000:
-
-        score += 8
-
-    elif 0 < market_cap < 10_000_000_000:
-
-        score += 5
-
-    # 과열 감점
-    score -= data["overheat_score"] * 0.4
-
-    # 급락 위험 감점
-    score -= data["crash_score"] * 0.4
-
-    return clamp(
-        round(score, 1)
-    )
-
-
-# =========================================================
-# 시장 상황
-# =========================================================
-
-def get_market_data():
-
-    indexes = [
-        "^GSPC",
-        "^IXIC",
-        "^DJI",
-        "^VIX",
-        "^TNX"
-    ]
-
-    result = {}
-
-    for symbol in indexes:
-
-        try:
-
-            hist = yf.Ticker(
-                symbol
-            ).history(
-                period="5d",
-                interval="1d"
-            )
-
-            if hist.empty:
-                continue
-
-            close = safe_float(
-                hist["Close"].iloc[-1]
-            )
-
-            previous = safe_float(
-                hist["Close"].iloc[-2]
-            )
-
-            change = (
-                ((close / previous) - 1)
-                * 100
-                if previous
-                else 0
-            )
-
-            result[symbol] = {
-
-                "value": close,
-
-                "change": change
-
             }
 
-        except Exception:
+        # -------------------------
+        # 404
+        # -------------------------
 
-            continue
+        if response.status_code == 404:
 
-    return result
+            return {
+                "success": False,
+                "reason": (
+                    "Gemini 모델/API endpoint를 "
+                    "찾을 수 없습니다."
+                )
+            }
+
+        # -------------------------
+        # 기타
+        # -------------------------
+
+        try:
+            err = response.json()
+        except:
+            err = response.text
+
+        return {
+            "success": False,
+            "reason": f"Gemini 오류 {response.status_code}: {err}"
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "reason": f"Gemini 요청 오류: {e}"
+        }
 
 
-# =========================================================
-# Gemini 분석
-# =========================================================
+# ============================================================
+# Gemini 프롬프트
+# ============================================================
 
-def build_gemini_prompt(candidates, market):
+def build_gemini_prompt(stock_data):
 
-    market_text = json.dumps(
-        market,
-        ensure_ascii=False
-    )
-
-    candidate_text = json.dumps(
-        candidates,
+    stock_json = json.dumps(
+        stock_data,
         ensure_ascii=False,
         indent=2
     )
 
     prompt = f"""
-당신은 미국 주식 시장을 분석하는
-'시니어 주식 전략 분석가'다.
-
-중요:
-절대로 확인되지 않은 사실을 만들어내지 마라.
-주가, 뉴스, 실적, 기업 이벤트를 추측해서 사실처럼 쓰지 마라.
-
-입력 데이터에 없는 내용은
-'확인되지 않음'이라고 표시하라.
+당신은 미국 주식시장의 시니어 전략 분석가입니다.
 
 목표:
-미국 주식 가운데 향후 단기 반등 가능성이 높은
-종목 10개를 선정한다.
+오늘부터 향후 24~72시간 동안
+반등/추가상승 가능성이 상대적으로 높은 미국 주식
+10개를 선정하세요.
 
-대형주만 고르지 말고
-중형주와 소형주도 적극적으로 검토한다.
+중요:
+절대로 확인되지 않은 뉴스나 숫자를 만들어내지 마세요.
 
-단, 소형주라고 해서 무조건 높은 순위를 주지 마라.
+반드시 Google Search를 이용해 최신 정보를 검증하세요.
 
-====================================
-분석 기준
-====================================
+현재 시각:
+{time_text()}
 
-1. 가격/거래량 모멘텀
+==================================================
+분석 후보 데이터
+==================================================
 
-2. 최근 반등 가능성
+{stock_json}
 
-3. RSI 및 이동평균
+==================================================
+핵심 분석 원칙
+==================================================
 
-4. 뉴스 모멘텀
+1. 대형주만 추천하지 마세요.
 
-5. 시장 전체 방향
+대형주:
+NVDA, AMD, TSM, AVGO 등
 
-6. 금리/VIX 환경
+중형주:
+ANET, SMCI, LUNR, RKLB 등
 
-7. 공매도 및 숏스퀴즈 가능성
-   단, 실제 데이터가 없으면 추측하지 않는다.
+소형/고변동 성장주:
+SOUN, BBAI, IONQ, QBTS, RGTI 등
 
-8. 소형주 급등 가능성
+후보군 전체를 비교하세요.
 
-9. 과열 여부
+단, 소형주라고 무조건 높은 점수를 주지 마세요.
 
-10. 급락 위험
+==================================================
+2. 최신 뉴스 검증
+==================================================
 
-====================================
-아이디어 1
-====================================
+각 종목에 대해 최근 24~48시간의
+중요 뉴스를 검색하세요.
 
-GitHub 개발활동과 대중 관심도의 시간차를 분석한다.
+확인할 것:
 
-GitHub 활동이 증가하면서
-시장 관심이 낮다면
-'미반영 기술 모멘텀' 가능성을 검토한다.
+- 실적
+- 가이던스
+- 신규 계약
+- AI 투자
+- 반도체 수요
+- 정부 정책
+- 금리
+- FDA
+- 우주산업
+- 데이터센터
+- IPO
+- 증자
+- 전환사채
+- 내부자 매도
+- 공매도
+- 소송
+- 규제
+- 악재
 
-단, GitHub 데이터가 없으면
-없는 것으로 처리한다.
+확인되지 않은 뉴스는 사용하지 마세요.
 
-====================================
-아이디어 2
-====================================
+==================================================
+3. 기술적 모멘텀
+==================================================
 
-보안/코드 위험 신호를 검토한다.
+거래량 증가
 
-공식적인 확인이 없는 경우
-해킹이나 내부자 매도를 단정하지 않는다.
+일간 상승률
 
-====================================
-아이디어 3
-====================================
+주간 상승률
 
-개발자 유입/기술 생태계 확장을 검토한다.
+월간 추세
 
-데이터가 없으면 평가하지 않는다.
+급등 후 과열 여부
 
-====================================
-아이디어 4
-====================================
+눌림목 가능성
 
-과도한 뉴스/검색 관심 대비
-실제 가격과 거래량의 질이 나쁜 경우
-펌핑 위험으로 평가한다.
+지지선/저항선
 
-====================================
-아이디어 5
-====================================
+을 고려하세요.
 
-기업/프로젝트 관련 갈등이나 악재가
-실제로 확인되는 경우만 반영한다.
+==================================================
+4. 급등 선행 아이디어
+==================================================
 
-====================================
-아이디어 6
-====================================
+GitHub 개발활동이 실제로 존재하는
+기술기업/프로젝트라면 다음을 조사하세요.
 
-신제품, 실적, 출시, 계약 등
-확인된 촉매가 있는지 확인한다.
+- 최근 커밋
+- 개발활동 증가
+- Release
+- PR
+- Issue
+- 핵심 개발자 활동
 
-====================================
-아이디어 7
-====================================
+개발활동 증가 + 대중 관심 낮음
 
-심각한 기술적/보안적 위험이
-실제 뉴스나 공식 자료로 확인되는 경우
-급락 위험 점수를 높인다.
+이라면
 
-====================================
-아이디어 8
-====================================
+"잠재적 기술 모멘텀"
 
-개발활동 감소나 성장동력 약화를 검토한다.
+으로 평가하세요.
 
-====================================
-아이디어 9
-====================================
+단순히 GitHub가 존재한다는 이유만으로
+주가 상승을 예측하지 마세요.
 
-악재 이후 실제 가격이 안정되고
-거래량이 회복되는 종목을
-역발상 반등 후보로 검토한다.
+==================================================
+5. GitHub Dumping Radar
+==================================================
 
-====================================
-아이디어 10
-====================================
+다음 키워드가 발견되면 위험 점수를 높이세요.
 
-두 관점으로 분석한다.
+exploit
+emergency
+pause
+unauthorized
+overflow
+rug pull
+freeze
+hack
+security
+rollback
 
-Agent A:
-가격/기술/개발활동
+특히 실제 보안문제와 관련된 내용이면
+급락 위험을 높이세요.
 
-Agent B:
-뉴스/시장심리/대중 관심
+==================================================
+6. Developer Migration
+==================================================
 
-두 관점이 동시에 긍정적이면
-상승 신뢰도를 높인다.
+개발자 활동 증가,
+새로운 Release,
+Contributor 증가,
+Fork 증가 등이 확인되면
+기술 모멘텀으로 참고하세요.
 
-====================================
-시장 데이터
-====================================
+하지만 GitHub 데이터만으로
+주가 급등을 단정하지 마세요.
 
-{market_text}
+==================================================
+7. Fake Hype
+==================================================
 
-====================================
-후보 데이터
-====================================
+뉴스와 검색량은 폭발하는데
 
-{candidate_text}
+실제 개발활동
 
-====================================
-출력
-====================================
+실적
 
-반드시 상위 10개만 선정한다.
+매출
 
-각 종목에 대해:
+계약
 
-순위
-티커
-기업명
-현재가격
-종합점수 100점
-상승 시나리오 점수 100점
-급락 위험 점수 100점
-소형주/중형주/대형주
-핵심 이유
-주요 촉매
-주의할 위험
-반등 가능성
+제품
 
-'반등 가능성'은
-실제 통계적 확률이라고 표현하지 말고
-'모델 시나리오 점수'라고 표현한다.
+등의 근거가 부족하면
 
-마지막에는 반드시:
+"과열 위험"
 
-🔥 오늘 가장 강한 3개
-⚡ 소형주 고위험 고수익 후보 3개
-🚨 급락 위험 종목 3개
+으로 평가하세요.
 
-를 별도로 표시한다.
+==================================================
+8. Governance / Developer Conflict
+==================================================
 
-절대로
-'무조건 상승'
-'100% 상승'
-'확실한 급등'
-같은 표현을 사용하지 않는다.
+다음 키워드를 확인하세요.
 
-JSON을 만들 필요는 없다.
-사람이 읽기 좋은 한국어 보고서를 작성하라.
+fork
+abandon
+rejected
+disagree
+scam
+shutdown
+delay
+
+심각한 개발자 갈등이나 프로젝트 중단이
+확인되면 급락 위험을 높이세요.
+
+==================================================
+9. Release / Upgrade
+==================================================
+
+신제품
+
+신규 플랫폼
+
+신규 Release
+
+대형 업그레이드
+
+상장
+
+파트너십
+
+등이 실제로 확인되면
+촉매로 평가하세요.
+
+==================================================
+10. Panic + Recovery
+==================================================
+
+악재 뉴스가 발생했지만
+
+회사 공식 발표
+
+제품 업데이트
+
+보안 패치
+
+실적
+
+계약
+
+등으로 문제가 해결된 것이 확인되면
+
+"반등 후보"
+
+로 평가하세요.
+
+==================================================
+11. Agent A
+==================================================
+
+GitHub / 기술 / 사업 데이터를
+엄격하게 평가하세요.
+
+==================================================
+12. Agent B
+==================================================
+
+Google Search / 뉴스 / 시장 심리를
+평가하세요.
+
+==================================================
+13. Consensus
+==================================================
+
+Agent A와 Agent B의 결과를 합쳐
+
+최종 점수를 만드세요.
+
+==================================================
+점수
+==================================================
+
+반등/추가상승 모멘텀:
+
+0~100
+
+급락 위험:
+
+0~100
+
+추격매수 위험:
+
+0~100
+
+데이터 신뢰도:
+
+0~100
+
+==================================================
+중요
+==================================================
+
+"성공확률"이라는 표현 대신
+"분석 점수"를 사용하세요.
+
+실제 미래 수익률을 보장하지 마세요.
+
+최신 정보가 확인되지 않은 종목은
+TOP 10에서 제외하세요.
+
+==================================================
+출력 형식
+==================================================
+
+반드시 다음 JSON 형태로 답하세요.
+
+{{
+    "market_summary": "오늘 시장 핵심 3줄",
+    "top10": [
+        {{
+            "rank": 1,
+            "symbol": "종목코드",
+            "company": "회사명",
+            "category": "대형/중형/소형",
+            "current_price": "확인된 가격",
+            "momentum_score": 0,
+            "downside_risk": 0,
+            "chase_risk": 0,
+            "confidence": 0,
+            "action": "관심/눌림목 관심/주의",
+            "reason": "핵심 이유",
+            "catalyst": "상승 촉매",
+            "risk": "주요 위험",
+            "news_verified": true
+        }}
+    ],
+    "small_cap_pick": {{
+        "symbol": "",
+        "reason": "",
+        "risk": ""
+    }},
+    "ipo_watch": {{
+        "symbol": "",
+        "reason": "",
+        "risk": ""
+    }},
+    "danger_top3": [
+        {{
+            "symbol": "",
+            "risk_score": 0,
+            "reason": ""
+        }}
+    ]
+}}
+
+JSON 이외의 문장은 출력하지 마세요.
 """
 
     return prompt
 
 
-def call_gemini(prompt):
+# ============================================================
+# JSON 추출
+# ============================================================
 
-    if not GEMINI_API_KEY:
+def extract_json(text):
 
-        return None, "GEMINI_API_KEY 없음"
+    if not text:
+        return None
 
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        "v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
+    text = text.strip()
 
-    headers = {
+    # ```json 제거
+    if "```json" in text:
+        text = text.replace("```json", "")
 
-        "Content-Type":
-            "application/json",
+    if "```" in text:
+        text = text.replace("```", "")
 
-        "x-goog-api-key":
-            GEMINI_API_KEY,
+    text = text.strip()
 
-    }
+    start = text.find("{")
+    end = text.rfind("}")
 
-    payload = {
+    if start == -1 or end == -1:
+        return None
 
-        "contents": [
+    text = text[start:end + 1]
 
-            {
+    try:
 
-                "parts": [
+        return json.loads(text)
 
-                    {
+    except Exception as e:
 
-                        "text": prompt
+        print("JSON 파싱 오류:", e)
 
-                    }
-
-                ]
-
-            }
-
-        ],
-
-        "generationConfig": {
-
-            "temperature": 0.2,
-
-            "maxOutputTokens": 7000
-
-        }
-
-    }
-
-    for attempt in range(3):
-
-        try:
-
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
-
-            if response.status_code == 200:
-
-                data = response.json()
-
-                candidates = data.get(
-                    "candidates",
-                    []
-                )
-
-                if not candidates:
-
-                    return None, (
-                        "Gemini 응답 후보 없음"
-                    )
-
-                text = (
-                    candidates[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                )
-
-                if text:
-
-                    return text, None
-
-                return None, (
-                    "Gemini 텍스트 응답 없음"
-                )
-
-            # quota
-            if response.status_code == 429:
-
-                print(
-                    "Gemini 429 RESOURCE_EXHAUSTED"
-                )
-
-                # 재시도
-                if attempt < 2:
-
-                    time.sleep(
-                        10 * (attempt + 1)
-                    )
-
-                    continue
-
-                return None, (
-                    "429 RESOURCE_EXHAUSTED"
-                )
-
-            try:
-
-                error = response.json()
-
-            except Exception:
-
-                error = response.text
-
-            return None, (
-                f"Gemini API 오류 "
-                f"{response.status_code}: "
-                f"{error}"
-            )
-
-        except Exception as e:
-
-            if attempt < 2:
-
-                time.sleep(5)
-
-                continue
-
-            return None, str(e)
-
-    return None, "Gemini 요청 실패"
+        return None
 
 
-# =========================================================
-# Gemini 실패 시 사용할 기본 보고서
-# =========================================================
+# ============================================================
+# Telegram 보고서
+# ============================================================
 
-def create_fallback_report(
-    candidates,
-    market
-):
-
-    candidates = sorted(
-        candidates,
-        key=lambda x:
-        x["pre_score"],
-        reverse=True
-    )[:TOP_N]
+def format_report(ai_data, market_data):
 
     lines = []
 
-    lines.append(
-        "⚠️ Gemini AI 분석은 현재 사용량 제한으로 "
-        "실행되지 않았습니다."
-    )
-
+    lines.append("🚨 미국 주식 전략 레이더")
+    lines.append("")
+    lines.append(f"⏰ {time_text()}")
     lines.append("")
 
-    lines.append(
-        "📊 아래 순위는 최신 시장 데이터 기반 "
-        "자동 점수입니다."
+    lines.append("📌 오늘의 시장 핵심")
+
+    market_summary = ai_data.get(
+        "market_summary",
+        "최신 시장 요약 없음"
     )
 
-    lines.append(
-        "※ AI 검증 완료 추천이 아닙니다."
-    )
+    lines.append(market_summary)
 
     lines.append("")
+    lines.append("🔥 반등/추가상승 관심 TOP 10")
+    lines.append("")
 
-    for i, item in enumerate(
-        candidates,
-        1
-    ):
+    top10 = ai_data.get("top10", [])
 
-        lines.append(
-            f"{i}️⃣ {item['ticker']} "
-            f"({item['sector']})"
+    for item in top10[:10]:
+
+        rank = item.get("rank", "?")
+        symbol = item.get("symbol", "?")
+        company = item.get("company", "")
+        category = item.get("category", "")
+
+        price = item.get(
+            "current_price",
+            "확인불가"
+        )
+
+        momentum = item.get(
+            "momentum_score",
+            0
+        )
+
+        downside = item.get(
+            "downside_risk",
+            0
+        )
+
+        chase = item.get(
+            "chase_risk",
+            0
+        )
+
+        confidence = item.get(
+            "confidence",
+            0
+        )
+
+        action = item.get(
+            "action",
+            ""
+        )
+
+        reason = item.get(
+            "reason",
+            ""
+        )
+
+        catalyst = item.get(
+            "catalyst",
+            ""
+        )
+
+        risk = item.get(
+            "risk",
+            ""
         )
 
         lines.append(
-            f"종합 데이터 점수: "
-            f"{item['pre_score']}/100"
+            f"{rank}️⃣ {symbol} {company}"
         )
 
         lines.append(
-            f"현재가: "
-            f"${item['price']:.2f}"
+            f"분류: {category}"
         )
 
         lines.append(
-            f"일간: "
-            f"{item['day_change']:+.2f}% | "
-            f"주간: "
-            f"{item['week_change']:+.2f}%"
+            f"현재가: {price}"
         )
 
         lines.append(
-            f"거래량: "
-            f"{item['volume_ratio']:.1f}배"
+            f"📈 모멘텀: {momentum}/100"
+        )
+
+        lines.append(
+            f"⚠️ 급락위험: {downside}/100"
+        )
+
+        lines.append(
+            f"🔥 추격위험: {chase}/100"
+        )
+
+        lines.append(
+            f"🧠 데이터 신뢰도: {confidence}/100"
+        )
+
+        lines.append(
+            f"🎯 전략: {action}"
+        )
+
+        lines.append(
+            f"이유: {reason}"
+        )
+
+        lines.append(
+            f"촉매: {catalyst}"
+        )
+
+        lines.append(
+            f"위험: {risk}"
         )
 
         lines.append("")
 
+    # 소형주
+    small = ai_data.get(
+        "small_cap_pick",
+        {}
+    )
+
+    if small:
+
+        lines.append("💎 오늘의 소형주 관심 후보")
+
+        lines.append(
+            f"⭐ {small.get('symbol', '없음')}"
+        )
+
+        lines.append(
+            small.get(
+                "reason",
+                ""
+            )
+        )
+
+        lines.append(
+            f"⚠️ {small.get('risk', '')}"
+        )
+
+        lines.append("")
+
+    # IPO
+    ipo = ai_data.get(
+        "ipo_watch",
+        {}
+    )
+
+    if ipo:
+
+        lines.append("🚀 IPO / 상장예정 관심")
+
+        lines.append(
+            f"⭐ {ipo.get('symbol', '없음')}"
+        )
+
+        lines.append(
+            ipo.get(
+                "reason",
+                ""
+            )
+        )
+
+        lines.append(
+            f"⚠️ {ipo.get('risk', '')}"
+        )
+
+        lines.append("")
+
+    # 급락
+    danger = ai_data.get(
+        "danger_top3",
+        []
+    )
+
+    if danger:
+
+        lines.append("🚨 급락 위험 TOP 3")
+
+        for i, item in enumerate(
+            danger[:3],
+            1
+        ):
+
+            lines.append(
+                f"{i}. "
+                f"{item.get('symbol', '')} "
+                f"위험도 "
+                f"{item.get('risk_score', 0)}/100"
+            )
+
+            lines.append(
+                item.get(
+                    "reason",
+                    ""
+                )
+            )
+
+        lines.append("")
+
+    # 자동 데이터
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("📊 자동 시장 데이터")
+    lines.append("━━━━━━━━━━━━━━")
+
+    for data in market_data[:10]:
+
+        lines.append(
+            f"{data['symbol']} "
+            f"${data['price']:.2f} | "
+            f"일 {data['daily_change']:+.2f}% | "
+            f"주 {data['weekly_change']:+.2f}% | "
+            f"거래량 {data['volume_ratio']:.1f}배"
+        )
+
+    lines.append("")
+
+    lines.append(
+        "⚠️ 본 분석은 투자 판단을 위한 참고자료이며 "
+        "수익이나 급등을 보장하지 않습니다."
+    )
+
     return "\n".join(lines)
 
 
-# =========================================================
-# Telegram 메시지 길이 분할
-# =========================================================
+# ============================================================
+# Gemini 실패 보고서
+# ============================================================
 
-def split_message(text, max_length=3900):
+def quota_report(reason):
 
-    if len(text) <= max_length:
+    return f"""
+🚨 미국 주식 전략 레이더
 
-        return [text]
+⏰ {time_text()}
 
-    chunks = []
+⚠️ Gemini 최신 정보 검증 실패
 
-    current = ""
+이번 분석에서는
+최신 뉴스/시장정보 검증이 완료되지 않았습니다.
 
-    for line in text.split("\n"):
+따라서 확인되지 않은 종목이나
+가짜 AI 분석 점수를 생성하지 않았습니다.
 
-        if len(current) + len(line) + 1 > max_length:
+원인:
+{reason}
 
-            chunks.append(current)
+━━━━━━━━━━━━━━
 
-            current = line
+📌 자동 데이터 수집 자체는 계속 가능합니다.
 
-        else:
+다음 실행에서 Gemini API가 정상화되면
+다시 전체 분석을 수행합니다.
 
-            current += (
-                ("\n" if current else "")
-                + line
-            )
-
-    if current:
-
-        chunks.append(current)
-
-    return chunks
+※ API 오류 상태에서는
+임의의 종목 추천을 생성하지 않습니다.
+"""
 
 
-# =========================================================
+# ============================================================
 # 메인
-# =========================================================
+# ============================================================
 
 def main():
 
-    start = now_kst()
+    print("=" * 60)
+    print("미국 주식 전략 레이더 시작")
+    print(time_text())
+    print("=" * 60)
 
-    print(
-        "=" * 60
-    )
+    # --------------------------------------------------------
+    # API 설정 확인
+    # --------------------------------------------------------
 
-    print(
-        "미국 주식 전략 레이더 시작"
-    )
+    missing = []
 
-    print(
-        start.strftime(
-            "%Y-%m-%d %H:%M:%S KST"
-        )
-    )
+    if not GEMINI_API_KEY:
+        missing.append("GEMINI_API_KEY")
 
-    print(
-        "=" * 60
-    )
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
 
-    # -----------------------------------------------------
-    # 1. 시장
-    # -----------------------------------------------------
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
 
-    print(
-        "\n[1/5] 시장 데이터 수집..."
-    )
+    if missing:
 
-    market = get_market_data()
-
-    # -----------------------------------------------------
-    # 2. 종목 데이터
-    # -----------------------------------------------------
-
-    print(
-        "\n[2/5] 종목 데이터 수집..."
-    )
-
-    raw_candidates = []
-
-    for ticker in TICKERS:
-
-        print(
-            f"  분석 중: {ticker}"
+        message = (
+            "🚨 미국 주식 전략 레이더 설정 오류\n\n"
+            "다음 GitHub Secrets가 없습니다:\n\n"
+            + "\n".join(
+                f"• {x}" for x in missing
+            )
         )
 
-        data = get_stock_data(
-            ticker
-        )
+        send_telegram(message)
 
-        if not data:
-
-            continue
-
-        news = get_news(
-            ticker,
-            data["name"]
-        )
-
-        github = get_github_activity(
-            ticker
-        )
-
-        pre_score = calculate_pre_score(
-            data,
-            len(news),
-            github
-        )
-
-        data["news"] = news
-
-        data["github"] = github
-
-        data["pre_score"] = pre_score
-
-        raw_candidates.append(
-            data
-        )
-
-        time.sleep(0.15)
-
-    if not raw_candidates:
-
-        error_message = (
-            "🚨 [미국 주식 전략 레이더]\n\n"
-            "주식 데이터를 가져오지 못했습니다.\n\n"
-            "Yahoo Finance 데이터 수집 상태를 "
-            "확인해주세요."
-        )
-
-        send_telegram(
-            error_message
-        )
+        print(message)
 
         return
 
-    # -----------------------------------------------------
-    # 3. 1차 후보 압축
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # 후보군
+    # --------------------------------------------------------
+
+    universe = build_stock_universe()
 
     print(
-        "\n[3/5] 후보 종목 압축..."
+        f"후보 종목 {len(universe)}개 수집"
     )
 
-    raw_candidates.sort(
-        key=lambda x:
-        x["pre_score"],
+    # --------------------------------------------------------
+    # 시장 데이터
+    # --------------------------------------------------------
+
+    market_data = []
+
+    for symbol in universe:
+
+        data = yahoo_quote(symbol)
+
+        if data:
+
+            data["market_score"] = (
+                calculate_market_score(data)
+            )
+
+            market_data.append(data)
+
+            print(
+                symbol,
+                data["price"],
+                data["daily_change"],
+                data["volume_ratio"]
+            )
+
+        time.sleep(0.15)
+
+    if not market_data:
+
+        message = (
+            "🚨 미국 주식 전략 레이더\n\n"
+            "시장 데이터를 가져오지 못했습니다.\n"
+            "이번 실행에서는 추천을 생성하지 않습니다."
+        )
+
+        send_telegram(message)
+
+        return
+
+    # --------------------------------------------------------
+    # 시장 데이터 우선순위
+    # --------------------------------------------------------
+
+    market_data.sort(
+        key=lambda x: x["market_score"],
         reverse=True
     )
 
-    candidates = raw_candidates[
-        :AI_CANDIDATES
-    ]
+    selected = market_data[:MAX_CANDIDATES]
 
-    # Gemini용 데이터 축소
-    ai_data = []
+    # --------------------------------------------------------
+    # Gemini 입력용 데이터
+    # --------------------------------------------------------
 
-    for item in candidates:
+    gemini_input = []
 
-        news_titles = [
-            x["title"]
-            for x in item["news"][:5]
-        ]
+    for data in selected:
 
-        ai_data.append({
+        gemini_input.append({
 
-            "ticker":
-                item["ticker"],
+            "symbol": data["symbol"],
 
-            "name":
-                item["name"],
+            "price": round(
+                data["price"],
+                2
+            ),
 
-            "sector":
-                item["sector"],
+            "daily_change": round(
+                data["daily_change"],
+                2
+            ),
 
-            "price":
-                round(
-                    item["price"],
-                    2
-                ),
+            "weekly_change": round(
+                data["weekly_change"],
+                2
+            ),
 
-            "day_change":
-                round(
-                    item["day_change"],
-                    2
-                ),
+            "monthly_change": round(
+                data["monthly_change"],
+                2
+            ),
 
-            "week_change":
-                round(
-                    item["week_change"],
-                    2
-                ),
+            "volume_ratio": round(
+                data["volume_ratio"],
+                2
+            ),
 
-            "month_change":
-                round(
-                    item["month_change"],
-                    2
-                ),
-
-            "volume_ratio":
-                round(
-                    item["volume_ratio"],
-                    2
-                ),
-
-            "rsi":
-                round(
-                    item["rsi"],
-                    1
-                ),
-
-            "from_high":
-                round(
-                    item["from_high"],
-                    2
-                ),
-
-            "market_cap":
-                item["market_cap"],
-
-            "short_ratio":
-                item["short_ratio"],
-
-            "pre_score":
-                item["pre_score"],
-
-            "news":
-                news_titles,
-
-            "github":
-                item["github"],
-
+            "automatic_market_score": (
+                data["market_score"]
+            )
         })
 
-    # -----------------------------------------------------
-    # 4. Gemini 분석
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Gemini
+    # --------------------------------------------------------
 
-    print(
-        "\n[4/5] Gemini AI 분석..."
-    )
+    print("Gemini 최신 정보 검증 시작")
 
     prompt = build_gemini_prompt(
-        ai_data,
-        market
+        gemini_input
     )
 
-    ai_report, ai_error = call_gemini(
+    ai_result = gemini_analyze(
         prompt
     )
 
-    # -----------------------------------------------------
-    # 5. 결과
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Gemini 실패
+    # --------------------------------------------------------
 
-    if ai_report:
+    if not ai_result.get("success"):
 
-        print(
-            "Gemini 분석 성공"
+        reason = ai_result.get(
+            "reason",
+            "알 수 없는 오류"
         )
 
-        header = (
-            "🚨 [미국 주식 전략 레이더]\n\n"
-            f"⏰ {start.strftime('%Y-%m-%d %H:%M:%S')} KST\n\n"
+        message = quota_report(
+            reason
         )
 
-        footer = (
-            "\n\n━━━━━━━━━━━━━━\n"
-            "⚠️ 투자 참고용\n"
-            "━━━━━━━━━━━━━━\n"
-            "본 분석은 최신 공개 데이터를 기반으로 "
-            "자동 생성된 정보입니다.\n"
-            "모델 점수는 실제 수익률이나 당첨 확률을 "
-            "보장하지 않습니다.\n"
-            "특히 소형주는 변동성과 손실 위험이 "
-            "높을 수 있습니다.\n"
+        send_telegram(message)
+
+        print(message)
+
+        return
+
+    # --------------------------------------------------------
+    # JSON
+    # --------------------------------------------------------
+
+    ai_data = extract_json(
+        ai_result.get("text", "")
+    )
+
+    if not ai_data:
+
+        message = (
+            "🚨 미국 주식 전략 레이더\n\n"
+            "Gemini 응답은 성공했지만 "
+            "분석 결과 JSON 검증에 실패했습니다.\n\n"
+            "이번 실행에서는 "
+            "추천 종목을 전송하지 않았습니다."
         )
 
-        final_message = (
-            header
-            + ai_report
-            + footer
+        send_telegram(message)
+
+        return
+
+    # --------------------------------------------------------
+    # 결과 검증
+    # --------------------------------------------------------
+
+    top10 = ai_data.get(
+        "top10",
+        []
+    )
+
+    verified_top10 = []
+
+    valid_symbols = {
+        x["symbol"]
+        for x in market_data
+    }
+
+    for item in top10:
+
+        symbol = item.get(
+            "symbol",
+            ""
+        ).upper()
+
+        # 실제 데이터에 존재하는 종목만
+        if symbol not in valid_symbols:
+            continue
+
+        # 뉴스 검증
+        if item.get(
+            "news_verified",
+            False
+        ) is not True:
+
+            continue
+
+        # 점수 정상화
+        for key in [
+            "momentum_score",
+            "downside_risk",
+            "chase_risk",
+            "confidence"
+        ]:
+
+            try:
+
+                value = float(
+                    item.get(
+                        key,
+                        0
+                    )
+                )
+
+                value = max(
+                    0,
+                    min(
+                        100,
+                        value
+                    )
+                )
+
+                item[key] = round(
+                    value
+                )
+
+            except:
+
+                item[key] = 0
+
+        verified_top10.append(
+            item
         )
 
-    else:
+    # --------------------------------------------------------
+    # 검증된 종목이 부족하면
+    # 임의로 채우지 않음
+    # --------------------------------------------------------
 
-        print(
-            "Gemini 실패:",
-            ai_error
+    if len(verified_top10) < 3:
+
+        message = (
+            "🚨 미국 주식 전략 레이더\n\n"
+            "Gemini 응답은 있었지만\n"
+            "최신 정보 검증을 통과한 종목이 "
+            "3개 미만입니다.\n\n"
+            "확인되지 않은 종목을 임의로 추가하지 "
+            "않았습니다.\n\n"
+            f"검증 통과: {len(verified_top10)}개"
         )
 
-        final_message = (
-            "🚨 [미국 주식 전략 레이더]\n\n"
-            f"⏰ {start.strftime('%Y-%m-%d %H:%M:%S')} KST\n\n"
-            + create_fallback_report(
-                candidates,
-                market
-            )
-            + "\n\n"
-            "━━━━━━━━━━━━━━\n"
-            "Gemini 상태\n"
-            "━━━━━━━━━━━━━━\n"
-            f"{ai_error}\n\n"
-            "※ AI 검증이 완료되지 않았으므로 "
-            "자동 점수만 참고하세요."
-        )
+        send_telegram(message)
 
-    # -----------------------------------------------------
+        return
+
+    ai_data["top10"] = verified_top10[:TOP_N]
+
+    # --------------------------------------------------------
     # Telegram
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    print(
-        "\n[5/5] Telegram 전송..."
+    report = format_report(
+        ai_data,
+        market_data
     )
 
-    chunks = split_message(
-        final_message
+    send_telegram(
+        report
     )
 
-    success = True
+    print("=" * 60)
+    print("분석 완료")
+    print("=" * 60)
 
-    for chunk in chunks:
 
-        if not send_telegram(
-            chunk
-        ):
-
-            success = False
-
-        time.sleep(1)
-
-    if success:
-
-        print(
-            "\n전송 완료!"
-        )
-
-    else:
-
-        print(
-            "\nTelegram 전송 일부 실패"
-        )
-
-    print(
-        "=" * 60
-    )
-
+# ============================================================
+# 실행
+# ============================================================
 
 if __name__ == "__main__":
-
     main()
