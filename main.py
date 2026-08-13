@@ -1,605 +1,704 @@
 import os
 import re
-import sys
-import time
 import html
+import time
 import requests
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
 
-from google import genai
-from google.genai import types
+# ============================================================
+# SEC Daily Rebound & Crash Signal Bot
+# 미국 증시 개장 전 브리핑
+#
+# 구조
+# 1. Gemini API 사용 가능 -> Gemini 브리핑
+# 2. Gemini 429/quota 오류 -> Google News RSS 자동 fallback
+# 3. 어떤 경우에도 Telegram 전송을 최대한 수행
+# ============================================================
 
 
 # ============================================================
-# 설정
+# 환경변수
 # ============================================================
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-MODEL_NAME = "gemini-3.6-flash"
 
-KST = ZoneInfo("Asia/Seoul")
+# 현재 안정적으로 사용할 Gemini 모델
+GEMINI_MODEL = "gemini-3.6-flash"
+
+
+# 한국시간
+KST = timezone(timedelta(hours=9))
+
+
+# ============================================================
+# 기본 설정
+# ============================================================
 
 TELEGRAM_MAX_LENGTH = 4000
 
+REQUEST_TIMEOUT = 20
+
+NEWS_LIMIT = 12
+
 
 # ============================================================
-# 환경변수 확인
+# 로그
 # ============================================================
 
-def check_environment():
-    missing = []
-
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
-
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-
-    if missing:
-        print("필수 환경변수가 없습니다.")
-        print(", ".join(missing))
-        sys.exit(1)
+def log(message):
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    print(f"[{now}] {message}")
 
 
 # ============================================================
 # Telegram 메시지 전송
 # ============================================================
 
-def split_message(text, max_length=TELEGRAM_MAX_LENGTH):
-    """
-    Telegram의 메시지 길이 제한을 고려해서
-    너무 긴 메시지를 여러 개로 나눔.
-    """
+def send_telegram(message):
 
-    text = text.strip()
+    if not TELEGRAM_BOT_TOKEN:
+        log("ERROR: TELEGRAM_BOT_TOKEN이 없습니다.")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        log("ERROR: TELEGRAM_CHAT_ID가 없습니다.")
+        return False
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    # Telegram은 메시지가 너무 길면 오류가 날 수 있으므로 분할
+    chunks = split_message(message, TELEGRAM_MAX_LENGTH)
+
+    success = True
+
+    for chunk in chunks:
+
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "disable_web_page_preview": True
+        }
+
+        try:
+
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            if response.ok:
+                log("Telegram 메시지 전송 성공")
+            else:
+                success = False
+                log(
+                    f"Telegram 전송 실패: "
+                    f"{response.status_code} "
+                    f"{response.text[:500]}"
+                )
+
+        except Exception as e:
+
+            success = False
+            log(f"Telegram 전송 오류: {e}")
+
+    return success
+
+
+# ============================================================
+# 긴 메시지 안전하게 분할
+# ============================================================
+
+def split_message(text, max_length=4000):
 
     if len(text) <= max_length:
         return [text]
 
-    parts = []
+    chunks = []
+
     current = ""
 
-    paragraphs = text.split("\n")
+    # 줄 단위 우선 분할
+    lines = text.split("\n")
 
-    for paragraph in paragraphs:
+    for line in lines:
 
-        # 한 줄 자체가 너무 긴 경우
-        if len(paragraph) > max_length:
+        if len(current) + len(line) + 1 <= max_length:
 
-            if current:
-                parts.append(current.strip())
-                current = ""
-
-            for i in range(0, len(paragraph), max_length):
-                parts.append(paragraph[i:i + max_length])
-
-            continue
-
-        candidate = current + paragraph + "\n"
-
-        if len(candidate) > max_length:
-
-            if current:
-                parts.append(current.strip())
-
-            current = paragraph + "\n"
+            current += line + "\n"
 
         else:
-            current = candidate
 
-    if current.strip():
-        parts.append(current.strip())
+            if current:
+                chunks.append(current.strip())
 
-    return parts
+            # 한 줄 자체가 너무 긴 경우
+            while len(line) > max_length:
+
+                chunks.append(line[:max_length])
+
+                line = line[max_length:]
+
+            current = line + "\n"
+
+    if current:
+        chunks.append(current.strip())
+
+    return chunks
 
 
-def send_telegram(text):
-    """
-    Telegram Bot API를 이용해 메시지를 전송한다.
-    """
+# ============================================================
+# Google News RSS
+# ============================================================
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+NEWS_FEEDS = [
 
-    messages = split_message(text)
+    (
+        "미국 증시",
+        "https://news.google.com/rss/search"
+        "?q=미국+증시+S%26P500+나스닥"
+        "&hl=ko&gl=KR&ceid=KR:ko"
+    ),
 
-    for message in messages:
+    (
+        "연준 금리",
+        "https://news.google.com/rss/search"
+        "?q=미국+연준+금리+FOMC"
+        "&hl=ko&gl=KR&ceid=KR:ko"
+    ),
 
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True
-        }
+    (
+        "미국 고용",
+        "https://news.google.com/rss/search"
+        "?q=미국+고용+고용지표+실업률"
+        "&hl=ko&gl=KR&ceid=KR:ko"
+    ),
 
-        response = requests.post(
-            url,
-            data=payload,
-            timeout=30
-        )
+    (
+        "미국 물가",
+        "https://news.google.com/rss/search"
+        "?q=미국+CPI+물가+인플레이션"
+        "&hl=ko&gl=KR&ceid=KR:ko"
+    ),
 
-        if response.status_code != 200:
-            print("Telegram 전송 실패:")
-            print(response.text)
-            raise RuntimeError(
-                f"Telegram API 오류: {response.status_code}"
+    (
+        "유가",
+        "https://news.google.com/rss/search"
+        "?q=국제유가+WTI+브렌트유"
+        "&hl=ko&gl=KR&ceid=KR:ko"
+    ),
+
+    (
+        "빅테크",
+        "https://news.google.com/rss/search"
+        "?q=미국+빅테크+애플+엔비디아+마이크로소프트+아마존"
+        "&hl=ko&gl=KR&ceid=KR:ko"
+    )
+]
+
+
+# ============================================================
+# RSS 뉴스 가져오기
+# ============================================================
+
+def get_news_from_rss():
+
+    all_news = []
+
+    for category, url in NEWS_FEEDS:
+
+        try:
+
+            response = requests.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                headers={
+                    "User-Agent":
+                    "Mozilla/5.0 "
+                    "SEC-Daily-Rebound-Crash-Bot"
+                }
             )
 
-        print("Telegram 메시지 전송 성공")
+            response.raise_for_status()
 
-        # 여러 메시지로 나뉜 경우 너무 빠르게 보내지 않도록 함
-        if len(messages) > 1:
-            time.sleep(1)
+            root = ET.fromstring(response.content)
 
+            for item in root.findall(".//item"):
 
-# ============================================================
-# Gemini API 오류 종류 확인
-# ============================================================
+                title = item.findtext("title", default="").strip()
 
-def is_quota_error(error):
-    """
-    Gemini 429 RESOURCE_EXHAUSTED 여부 확인
-    """
+                description = item.findtext(
+                    "description",
+                    default=""
+                ).strip()
 
-    error_text = str(error).upper()
+                pub_date = item.findtext(
+                    "pubDate",
+                    default=""
+                ).strip()
 
-    return (
-        "429" in error_text
-        or "RESOURCE_EXHAUSTED" in error_text
-        or "QUOTA" in error_text
-        or "RATE LIMIT" in error_text
-    )
+                link = item.findtext(
+                    "link",
+                    default=""
+                ).strip()
 
+                if not title:
+                    continue
 
-# ============================================================
-# Gemini 응답이 정상적인지 검사
-# ============================================================
+                # HTML 제거
+                clean_description = re.sub(
+                    r"<[^>]+>",
+                    "",
+                    description
+                )
 
-def clean_response(text):
-    """
-    Gemini가 반환한 텍스트를 정리한다.
-    """
+                clean_description = html.unescape(
+                    clean_description
+                )
 
-    if not text:
-        return ""
+                all_news.append({
+                    "category": category,
+                    "title": title,
+                    "description": clean_description,
+                    "pub_date": pub_date,
+                    "link": link
+                })
 
-    text = text.strip()
+        except Exception as e:
 
-    # Markdown 코드블록 제거
-    text = re.sub(r"^```.*?\n", "", text)
-    text = re.sub(r"\n```$", "", text)
+            log(
+                f"RSS 수집 실패 "
+                f"({category}): {e}"
+            )
 
-    # 불필요한 공백 정리
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 중복 제거
+    unique = []
 
-    return text.strip()
+    seen = set()
 
+    for news in all_news:
 
-def response_looks_broken(text):
-    """
-    Gemini 응답이 중간에서 잘린 것으로 보이는지 검사한다.
+        key = re.sub(
+            r"\s+",
+            " ",
+            news["title"]
+        ).strip()
 
-    예:
-    - 고용 급...
-    - 금리 인상 우려가 완
-    - 못해...
-    """
+        if key in seen:
+            continue
 
-    if not text:
-        return True
+        seen.add(key)
+        unique.append(news)
 
-    stripped = text.strip()
-
-    # 너무 짧으면 실패로 처리
-    if len(stripped) < 120:
-        return True
-
-    # 끝이 명백한 말줄임표인 경우
-    if stripped.endswith("..."):
-        return True
-
-    if stripped.endswith("…"):
-        return True
-
-    # 한국어 문장이 조사/접속사 등에서 끝나는 경우
-    broken_endings = (
-        "그리고",
-        "또한",
-        "하지만",
-        "때문에",
-        "영향",
-        "영향을",
-        "우려",
-        "가능",
-        "가능성",
-        "증가",
-        "감소",
-        "급",
-        "완",
-        "못해",
-        "따라",
-        "관련",
-        "대해",
-        "및",
-        "또는",
-        "것으로",
-        "전망"
-    )
-
-    last_line = stripped.splitlines()[-1].strip()
-
-    for ending in broken_endings:
-        if last_line.endswith(ending):
-            return True
-
-    return False
+    return unique[:NEWS_LIMIT]
 
 
 # ============================================================
-# Gemini에게 미국 증시 브리핑 요청
+# 뉴스 텍스트 만들기
 # ============================================================
 
-def generate_market_briefing():
-    """
-    Google Search grounding을 이용해서 최신 미국 증시 자료를 검색하고
-    Gemini가 한국어 브리핑을 작성한다.
+def make_news_context(news_list):
 
-    중요:
-    Gemini API는 이 함수에서 1회만 호출한다.
-    """
+    if not news_list:
+        return "현재 RSS에서 수집된 뉴스가 없습니다."
 
-    now = datetime.now(KST)
+    lines = []
 
-    today = now.strftime("%Y년 %m월 %d일")
-    current_time = now.strftime("%H:%M")
+    for i, news in enumerate(news_list, start=1):
 
-    prompt = f"""
-너는 미국 증시 개장 전 시장 브리핑을 작성하는 금융 뉴스 분석가다.
+        title = news["title"]
 
-현재 한국시간:
-{today} {current_time}
+        description = news["description"]
 
-반드시 Google Search를 사용해서 최신 정보를 확인한 뒤 작성하라.
+        if len(description) > 250:
+            description = description[:250] + "..."
 
-목적:
-한국 투자자가 미국 증시 개장 전에 빠르게 읽을 수 있는
-짧고 정확한 시장 브리핑을 만드는 것이다.
+        lines.append(
+            f"{i}. [{news['category']}] {title}\n"
+            f"   내용: {description}"
+        )
 
-━━━━━━━━━━━━━━━━━━━━
-[매우 중요한 사실 확인 규칙]
-━━━━━━━━━━━━━━━━━━━━
+    return "\n\n".join(lines)
 
-1. 반드시 최신 웹 검색 결과를 바탕으로 작성한다.
 
-2. 검색 결과에서 확인되지 않은 숫자를 절대 만들지 마라.
+# ============================================================
+# Gemini API 호출
+# ============================================================
 
-3. 유가, 금리, 국채금리, 지수, 고용지표 등의 수치는
-   검색 결과에서 실제로 확인된 경우에만 사용한다.
+def generate_with_gemini(news_context):
 
-4. 특히 다음과 같은 숫자를 임의로 만들지 마라.
+    if not GEMINI_API_KEY:
 
-   - 국제유가
-   - WTI
-   - 브렌트유
-   - 미국 10년물 국채금리
-   - 미국 기준금리
-   - 실업률
-   - 비농업 고용
-   - CPI
-   - PPI
-   - 나스닥
-   - S&P500
-   - 다우지수
+        log("GEMINI_API_KEY 없음 -> RSS fallback")
 
-5. 검색 결과에서 숫자가 확인되지 않으면
-   숫자를 쓰지 말고 "상승", "하락", "둔화" 등의 표현을 사용하라.
+        return None
 
-6. 과거 뉴스와 오늘 뉴스를 혼동하지 마라.
+    try:
 
-7. 오늘 발표된 자료가 없다면 억지로 오늘 발표된 것처럼 쓰지 마라.
+        from google import genai
 
-8. 확인되지 않은 속보를 사실처럼 작성하지 마라.
+        log(
+            f"Gemini API 요청 시작 "
+            f"({GEMINI_MODEL})"
+        )
 
-9. "현물 유가가 140달러를 돌파했다"와 같은 내용도
-   실제 검색 결과에서 확인되지 않았다면 절대 작성하지 마라.
+        client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
 
-10. 서로 충돌하는 뉴스가 있으면 양쪽 내용을 확인하고
-    가장 신뢰할 수 있는 최신 정보를 우선하라.
+        prompt = f"""
+당신은 미국 증시 개장 전 시장 브리핑을 작성하는 금융 뉴스 분석가입니다.
 
-━━━━━━━━━━━━━━━━━━━━
-[검색해야 할 내용]
-━━━━━━━━━━━━━━━━━━━━
+아래 최신 뉴스 자료만 참고하여 한국어로 짧고 정확한
+미국 증시 개장 전 브리핑을 작성하세요.
 
-다음 항목을 확인하라.
+중요 규칙:
 
-① 미국 주요 증시 선물
-- S&P500 선물
-- 나스닥100 선물
-- 다우 선물
+1. 확인되지 않은 숫자나 사실을 절대 만들지 마세요.
+2. 뉴스에 없는 내용을 추측하지 마세요.
+3. 숫자가 뉴스에 명확히 나오지 않으면 숫자를 쓰지 마세요.
+4. 투자 권유를 하지 마세요.
+5. 지나치게 긴 설명을 하지 마세요.
+6. 한 문장이 중간에 잘리지 않도록 완결된 문장으로 작성하세요.
+7. 전체 길이는 약 700~1200자 이내로 작성하세요.
 
-② 미국 국채 및 연준
-- 미국 10년물 국채금리
-- 연준 금리 전망
-- 금리 인상/인하 기대 변화
-
-③ 주요 경제지표
-- 고용
-- 실업률
-- CPI
-- PPI
-- 소비자심리
-- 소매판매
-- 기타 오늘 발표된 주요 지표
-
-④ 국제유가
-- WTI
-- 브렌트유
-- 중동 지정학적 위험
-- 유가 상승/하락 요인
-
-⑤ 빅테크 및 주요 기업 뉴스
-- NVIDIA
-- Apple
-- Microsoft
-- Amazon
-- Alphabet
-- Meta
-- Tesla
-- 기타 미국 증시에 영향을 줄 만한 주요 기업
-
-⑥ 오늘 미국 증시에 가장 중요한 뉴스
-
-━━━━━━━━━━━━━━━━━━━━
-[출력 형식]
-━━━━━━━━━━━━━━━━━━━━
-
-반드시 아래 형식으로 작성하라.
+반드시 다음 형식을 사용하세요.
 
 🚨 [미국 증시 개장 전 브리핑]
 
-📅 {today}
+📌 오늘의 핵심
+- 핵심 뉴스 1
+- 핵심 뉴스 2
+- 핵심 뉴스 3
 
-1. 미국 증시 선물
-- S&P500:
-- 나스닥100:
-- 다우:
+📈 미국 증시 영향
+- S&P500 / 나스닥에 영향을 줄 수 있는 요인
+- 금리 및 연준 관련 요인
+- 유가 및 경기 관련 요인
 
-2. 금리·연준
-- 핵심 내용:
-- 미국 증시에 미칠 영향:
+🏦 금리·연준
+- 확인된 최신 내용을 짧게 설명
 
-3. 경제지표
-- 핵심 내용:
-- 시장 영향:
+🛢 유가·원자재
+- 확인된 최신 내용을 짧게 설명
 
-4. 유가·지정학
-- 핵심 내용:
-- 시장 영향:
+💼 주요 기업·빅테크
+- 중요한 기업 뉴스가 있을 경우 설명
 
-5. 빅테크·기업
-- 핵심 내용:
-- 시장 영향:
+⚠️ 체크포인트
+- 오늘 미국 증시에서 확인할 사항
 
-6. 오늘의 핵심 체크포인트
-- 첫 번째:
-- 두 번째:
-- 세 번째:
+아래는 뉴스 자료입니다.
 
-━━━━━━━━━━━━━━━━━━━━
-[작성 스타일]
-━━━━━━━━━━━━━━━━━━━━
-
-- 한국어
-- 짧고 명확하게
-- 투자자가 1분 안에 읽을 수 있게 작성
-- 각 항목은 1~2문장 정도
-- 불필요한 설명 금지
-- 확인되지 않은 사실 금지
-- 추측은 반드시 "가능성"이라고 표시
-- 투자 권유 금지
-- "매수", "매도"를 단정하지 마라
-- 뉴스가 없으면 없다고 작성하라
-- 문장을 반드시 완결해서 끝내라
-- 문장 중간에서 끊지 마라
-- 말줄임표(...) 사용 금지
-- 마지막 문장은 반드시 완결된 문장으로 끝내라.
-
-중요:
-검색 결과를 단순히 복사하지 말고,
-미국 증시에 어떤 영향을 줄 수 있는지 짧게 설명하라.
+{news_context}
 """
 
-    print("Gemini API 요청 시작...")
-    print(f"모델: {MODEL_NAME}")
-    print("Google Search grounding 사용")
-
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-
-    config = types.GenerateContentConfig(
-        tools=[
-            types.Tool(
-                google_search=types.GoogleSearch()
-            )
-        ],
-        max_output_tokens=1800
-    )
-
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=config
-    )
-
-    text = clean_response(response.text)
-
-    if response_looks_broken(text):
-        raise RuntimeError(
-            "Gemini 응답이 완성되지 않은 것으로 판단되어 "
-            "Telegram 전송을 중단했습니다."
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
         )
 
-    return text
+        text = getattr(response, "text", None)
+
+        if not text:
+            log("Gemini 응답 내용 없음")
+            return None
+
+        text = text.strip()
+
+        if len(text) < 100:
+            log("Gemini 응답이 너무 짧음")
+            return None
+
+        log("Gemini 브리핑 생성 성공")
+
+        return text
+
+    except Exception as e:
+
+        error_text = str(e)
+
+        log(
+            f"Gemini API 오류: "
+            f"{error_text[:1000]}"
+        )
+
+        # 429 quota 오류
+        if (
+            "429" in error_text
+            or "RESOURCE_EXHAUSTED" in error_text
+            or "quota" in error_text.lower()
+            or "rate limit" in error_text.lower()
+        ):
+
+            log(
+                "Gemini quota/rate limit 감지 -> "
+                "RSS fallback으로 전환"
+            )
+
+        return None
 
 
 # ============================================================
-# Gemini 실패 시 Telegram으로 보내는 안전한 안내
+# Gemini 실패용 자동 브리핑
 # ============================================================
 
-def create_quota_error_message(error):
-    """
-    Gemini quota 오류가 발생했을 때
-    잘못된 시장 정보를 보내지 않고 상태만 알려준다.
-    """
+def generate_fallback_briefing(news_list):
 
-    return f"""🚨 [미국 증시 개장 전 브리핑]
+    now = datetime.now(KST)
 
-Gemini API 사용량 제한으로
-최신 AI 브리핑을 생성하지 못했습니다.
+    date_text = now.strftime(
+        "%Y-%m-%d %H:%M KST"
+    )
 
-현재 Gemini API가
-429 RESOURCE_EXHAUSTED를 반환했습니다.
+    if not news_list:
 
-확인할 사항:
-1. Gemini API 사용량
-2. RPM / TPM / RPD quota
-3. Google AI Studio 사용량 및 결제 상태
+        return f"""🚨 [미국 증시 개장 전 브리핑]
 
-※ 이번 실행에서는 확인되지 않은 시장 정보를
-임의로 생성하지 않고 전송하지 않았습니다.
+📅 {date_text}
 
-오류 시간:
-{datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")} KST
+현재 Gemini API 사용량 제한으로 AI 분석을 이용할 수 없습니다.
+
+또한 현재 뉴스 RSS에서도 확인 가능한 최신 뉴스가 충분하지 않아 시장 방향을 임의로 판단하지 않았습니다.
+
+⚠️ 확인 필요
+- 미국 주요 지수
+- 연준 및 금리 관련 뉴스
+- 고용·물가 지표
+- 국제유가
+- 주요 빅테크 기업 뉴스
+
+※ 확인되지 않은 시장 정보는 임의로 생성하지 않았습니다.
 """
 
+    # 카테고리별로 최대 2개씩 선택
+    grouped = {}
 
-def create_general_error_message(error):
-    """
-    Gemini의 일반적인 오류 발생 시
-    잘못된 시장 정보를 보내지 않는다.
-    """
+    for news in news_list:
 
-    error_short = str(error)
+        category = news["category"]
 
-    # 너무 긴 오류 메시지는 잘라서 표시
-    if len(error_short) > 800:
-        error_short = error_short[:800] + "..."
+        if category not in grouped:
+            grouped[category] = []
 
-    return f"""🚨 [미국 증시 개장 전 브리핑]
+        if len(grouped[category]) < 2:
+            grouped[category].append(news)
 
-최신 시장 브리핑 생성 중 오류가 발생했습니다.
+    lines = []
 
-이번 실행에서는 확인되지 않은 정보를
-임의로 전송하지 않았습니다.
+    lines.append(
+        "🚨 [미국 증시 개장 전 브리핑]"
+    )
 
-오류:
-{error_short}
+    lines.append("")
+    lines.append(
+        f"📅 {date_text}"
+    )
 
-오류 시간:
-{datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")} KST
-"""
+    lines.append("")
+    lines.append(
+        "⚠️ Gemini API quota 초과로 "
+        "AI 분석 대신 최신 뉴스 기반 자동 브리핑을 제공합니다."
+    )
+
+    # --------------------------------------------------------
+    # 핵심 뉴스
+    # --------------------------------------------------------
+
+    lines.append("")
+    lines.append("📌 오늘의 핵심 뉴스")
+
+    count = 0
+
+    for news in news_list:
+
+        if count >= 5:
+            break
+
+        title = news["title"]
+
+        lines.append(
+            f"- {title}"
+        )
+
+        count += 1
+
+    # --------------------------------------------------------
+    # 카테고리별
+    # --------------------------------------------------------
+
+    category_order = [
+        "미국 증시",
+        "연준 금리",
+        "미국 고용",
+        "미국 물가",
+        "유가",
+        "빅테크"
+    ]
+
+    for category in category_order:
+
+        items = grouped.get(category, [])
+
+        if not items:
+            continue
+
+        lines.append("")
+        lines.append(
+            f"📍 {category}"
+        )
+
+        for news in items:
+
+            title = news["title"]
+
+            # 제목이 지나치게 길면 안전하게 자름
+            if len(title) > 180:
+                title = title[:180] + "..."
+
+            lines.append(
+                f"- {title}"
+            )
+
+    # --------------------------------------------------------
+    # 체크포인트
+    # --------------------------------------------------------
+
+    lines.append("")
+    lines.append("⚠️ 오늘의 체크포인트")
+
+    lines.append(
+        "- 미국 주요 지수의 선물 흐름"
+    )
+
+    lines.append(
+        "- 미국 국채금리와 연준 관련 발언"
+    )
+
+    lines.append(
+        "- 고용 및 물가 관련 지표"
+    )
+
+    lines.append(
+        "- 국제유가 움직임"
+    )
+
+    lines.append(
+        "- 엔비디아 등 주요 빅테크 뉴스"
+    )
+
+    lines.append("")
+    lines.append(
+        "※ 본 메시지는 Gemini API 오류 시 사용하는 "
+        "뉴스 기반 자동 fallback입니다."
+    )
+
+    lines.append(
+        "※ 확인되지 않은 수치나 시장 전망은 임의로 생성하지 않았습니다."
+    )
+
+    return "\n".join(lines)
 
 
 # ============================================================
-# 메인 실행
+# 메인
 # ============================================================
 
 def main():
 
-    print("=" * 60)
-    print("미국 증시 개장 전 브리핑 봇 시작")
-    print("=" * 60)
+    log("=" * 60)
 
-    check_environment()
+    log("SEC Daily Rebound & Crash Signal Bot 시작")
 
-    now = datetime.now(KST)
+    log("=" * 60)
 
-    print(
-        "현재 한국시간:",
-        now.strftime("%Y-%m-%d %H:%M:%S")
+    # --------------------------------------------------------
+    # 1. 뉴스 수집
+    # --------------------------------------------------------
+
+    log("최신 뉴스 RSS 수집 시작")
+
+    news_list = get_news_from_rss()
+
+    log(
+        f"수집된 뉴스 수: {len(news_list)}"
+    )
+
+    news_context = make_news_context(
+        news_list
     )
 
     # --------------------------------------------------------
-    # Gemini 브리핑 생성
+    # 2. Gemini 시도
     # --------------------------------------------------------
 
-    try:
-
-        briefing = generate_market_briefing()
-
-        print("\nGemini 브리핑 생성 성공")
-        print("-" * 60)
-        print(briefing)
-        print("-" * 60)
-
-    except Exception as error:
-
-        print("\nGemini API 오류 발생")
-        print(error)
-
-        # 429이면 quota 안내
-        if is_quota_error(error):
-
-            print("429 RESOURCE_EXHAUSTED 감지")
-
-            telegram_message = create_quota_error_message(
-                error
-            )
-
-        else:
-
-            telegram_message = create_general_error_message(
-                error
-            )
-
-        # ----------------------------------------------------
-        # 오류 상황도 Telegram에는 정상적으로 알림
-        # ----------------------------------------------------
-
-        try:
-
-            send_telegram(telegram_message)
-
-            print("오류 안내 Telegram 전송 성공")
-
-        except Exception as telegram_error:
-
-            print("Telegram 오류 안내 전송 실패")
-            print(telegram_error)
-
-        # ----------------------------------------------------
-        # 중요:
-        # GitHub Actions를 불필요하게 실패시키지 않음
-        # ----------------------------------------------------
-
-        return
+    briefing = generate_with_gemini(
+        news_context
+    )
 
     # --------------------------------------------------------
-    # 정상적인 Gemini 결과만 Telegram으로 전송
+    # 3. Gemini 실패 -> fallback
     # --------------------------------------------------------
 
-    telegram_message = briefing
+    if not briefing:
 
-    try:
+        log(
+            "Gemini 브리핑 생성 실패 -> "
+            "뉴스 기반 fallback 사용"
+        )
 
-        send_telegram(telegram_message)
+        briefing = generate_fallback_briefing(
+            news_list
+        )
 
-        print("=" * 60)
-        print("최종 처리 완료")
-        print("=" * 60)
+    # --------------------------------------------------------
+    # 4. 마지막 안전장치
+    # --------------------------------------------------------
 
-    except Exception as error:
+    if not briefing:
 
-        print("Telegram 전송 중 오류 발생")
-        print(error)
+        briefing = """🚨 [미국 증시 개장 전 브리핑]
 
-        raise
+현재 브리핑 생성 과정에서 문제가 발생했습니다.
+
+Gemini API 및 최신 뉴스 데이터를 확인할 수 없어
+확인되지 않은 시장 정보를 임의로 생성하지 않았습니다.
+"""
+
+    # --------------------------------------------------------
+    # 5. Telegram 전송
+    # --------------------------------------------------------
+
+    log("Telegram 메시지 전송 시작")
+
+    result = send_telegram(
+        briefing
+    )
+
+    if result:
+
+        log(
+            "브리핑 전송 완료"
+        )
+
+    else:
+
+        log(
+            "브리핑 전송 실패"
+        )
+
+    log("=" * 60)
+
+    log("프로그램 종료")
+
+    log("=" * 60)
 
 
 # ============================================================
