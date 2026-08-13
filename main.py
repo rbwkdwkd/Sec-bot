@@ -1,13 +1,19 @@
 import os
 import time
+import random
 import requests
+
 from google import genai
 from google.genai import types
 
 
 # ============================================================
 # 환경변수
-# GitHub Secrets에서 가져옵니다.
+# GitHub Secrets에서 다음 3개를 설정하세요.
+#
+# GEMINI_API_KEY
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_CHAT_ID
 # ============================================================
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -16,26 +22,296 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
-# Gemini 모델 설정
+# 기본 설정
 # ============================================================
 
-# 1순위: Gemini 3.6 Flash
-# 2순위: Gemini 3.5 Flash-Lite
-#
-# 3.5 Flash-Lite는 고처리량/저비용 작업에 적합하고
-# Google Search grounding도 지원합니다.
-MODELS = [
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-]
+MODEL_NAME = "gemini-3.6-flash"
+
+# Gemini 일시적 오류 재시도 횟수
+MAX_RETRIES = 4
+
+# 최초 대기 시간
+BASE_DELAY = 5
 
 
 # ============================================================
-# 기본 확인
+# Telegram 메시지 전송
 # ============================================================
 
-def check_environment():
-    """필수 환경변수가 있는지 확인"""
+def send_telegram_message(message):
+    """Telegram Bot으로 메시지를 전송합니다."""
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN이 없습니다.")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print("TELEGRAM_CHAT_ID가 없습니다.")
+        return False
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+
+    try:
+        response = requests.post(
+            url,
+            data=data,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        print("Telegram 메시지 전송 성공")
+        return True
+
+    except requests.exceptions.RequestException as e:
+        print(f"Telegram 메시지 전송 실패: {e}")
+        return False
+
+
+# ============================================================
+# 오류가 재시도 가능한 오류인지 확인
+# ============================================================
+
+def is_retryable_error(error):
+    """
+    Gemini 오류 중 재시도할 가치가 있는 오류인지 판단합니다.
+
+    재시도:
+    - 429 RESOURCE_EXHAUSTED
+    - 503 UNAVAILABLE
+    - 408 timeout
+    - 일시적인 네트워크 오류
+
+    재시도하지 않음:
+    - API KEY 오류
+    - 잘못된 요청
+    - 권한 오류
+    - 모델 이름 오류
+    """
+
+    error_text = str(error).lower()
+
+    retry_keywords = [
+        "429",
+        "resource_exhausted",
+        "too many requests",
+        "rate limit",
+        "quota",
+        "503",
+        "unavailable",
+        "408",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "internal server error"
+    ]
+
+    for keyword in retry_keywords:
+        if keyword in error_text:
+            return True
+
+    return False
+
+
+# ============================================================
+# Gemini API 호출
+# ============================================================
+
+def generate_market_briefing():
+    """
+    Gemini를 이용하여 최신 미국 증시 개장 전 브리핑을 생성합니다.
+    """
+
+    if not GEMINI_API_KEY:
+        raise ValueError(
+            "GEMINI_API_KEY가 GitHub Secrets에 설정되어 있지 않습니다."
+        )
+
+    print("Gemini API 요청 준비 중...")
+
+    # Gemini Client 생성
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+    # --------------------------------------------------------
+    # 최신 웹 검색을 사용하는 Gemini 설정
+    # --------------------------------------------------------
+
+    config = types.GenerateContentConfig(
+        tools=[
+            types.Tool(
+                google_search=types.GoogleSearch()
+            )
+        ],
+
+        # 너무 긴 답변을 방지
+        max_output_tokens=1200,
+
+        # 답변을 너무 창작하지 않도록 낮게 설정
+        temperature=0.2
+    )
+
+    # --------------------------------------------------------
+    # 프롬프트
+    # --------------------------------------------------------
+
+    prompt = """
+오늘 미국 증시 개장 전 브리핑을 작성해줘.
+
+반드시 최신 웹 검색 정보를 활용해줘.
+
+다음 내용을 중심으로 한국어로 작성해줘.
+
+1. 미국 주요 지수
+   - S&P 500
+   - Nasdaq
+   - Dow Jones
+
+2. 미국 증시에 영향을 줄 주요 경제 이슈
+   - 금리
+   - 연준(Fed)
+   - 물가
+   - 고용
+   - 주요 경제지표
+
+3. 미국 빅테크 및 주요 기업 뉴스
+
+4. 오늘 미국 증시에 영향을 줄 가능성이 큰 핵심 뉴스 3가지
+
+5. 오늘 미국 증시 전망
+   - 상승/하락에 영향을 줄 요인
+   - 투자자가 주의할 점
+
+작성 규칙:
+
+- 최신 웹 검색 결과를 기준으로 작성할 것
+- 가능한 경우 오늘 발표된 정보와 최근 24시간 이내 정보를 우선할 것
+- 확인되지 않은 사실을 만들어내지 말 것
+- 한국어로 짧고 이해하기 쉽게 작성할 것
+- 투자 조언이 아니라 시장 정보 브리핑이라는 점을 유지할 것
+- 각 항목은 핵심 내용 위주로 작성할 것
+- 너무 긴 설명은 하지 말 것
+
+맨 처음에는 다음 제목을 사용해줘.
+
+🚨 [미국 증시 개장 전 브리핑]
+"""
+
+    # --------------------------------------------------------
+    # Gemini API 호출 + 재시도
+    # --------------------------------------------------------
+
+    for attempt in range(MAX_RETRIES + 1):
+
+        try:
+            print(
+                f"Gemini API 요청 중... "
+                f"(시도 {attempt + 1}/{MAX_RETRIES + 1})"
+            )
+
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=config
+            )
+
+            # ------------------------------------------------
+            # 정상 응답
+            # ------------------------------------------------
+
+            text = response.text
+
+            if not text:
+                raise ValueError(
+                    "Gemini가 빈 응답을 반환했습니다."
+                )
+
+            print("Gemini API 요청 성공")
+
+            return text.strip()
+
+        except Exception as e:
+
+            print("----------------------------------------")
+            print("Gemini API 오류 발생")
+            print(str(e))
+            print("----------------------------------------")
+
+            # -----------------------------------------------
+            # 재시도 가능한 오류인지 확인
+            # -----------------------------------------------
+
+            if not is_retryable_error(e):
+
+                print(
+                    "재시도할 수 없는 오류입니다."
+                )
+
+                raise
+
+            # -----------------------------------------------
+            # 마지막 시도였다면 종료
+            # -----------------------------------------------
+
+            if attempt >= MAX_RETRIES:
+
+                print(
+                    "최대 재시도 횟수를 초과했습니다."
+                )
+
+                raise
+
+            # -----------------------------------------------
+            # 지수 백오프
+            #
+            # 5초
+            # 10초
+            # 20초
+            # 40초
+            #
+            # + 약간의 랜덤 시간(jitter)
+            # -----------------------------------------------
+
+            delay = BASE_DELAY * (2 ** attempt)
+
+            jitter = random.uniform(0, 2)
+
+            total_delay = delay + jitter
+
+            print(
+                f"잠시 후 재시도합니다: "
+                f"{total_delay:.1f}초"
+            )
+
+            time.sleep(total_delay)
+
+    raise RuntimeError(
+        "Gemini API 호출에 실패했습니다."
+    )
+
+
+# ============================================================
+# 메인 프로그램
+# ============================================================
+
+def main():
+
+    print("========================================")
+    print("미국 증시 개장 전 브리핑 봇 시작")
+    print("========================================")
+
+    # --------------------------------------------------------
+    # 환경변수 확인
+    # --------------------------------------------------------
 
     missing = []
 
@@ -49,361 +325,115 @@ def check_environment():
         missing.append("TELEGRAM_CHAT_ID")
 
     if missing:
-        raise ValueError(
-            "다음 GitHub Secrets가 없습니다: "
-            + ", ".join(missing)
+
+        error_message = (
+            "🚨 [미국 증시 개장 전 브리핑]\n\n"
+            "환경변수가 설정되지 않았습니다.\n\n"
+            "누락된 항목:\n"
+            + "\n".join(
+                f"- {item}" for item in missing
+            )
         )
 
+        print(error_message)
 
-# ============================================================
-# Gemini API 요청
-# ============================================================
+        # Telegram 설정이 되어 있는 경우에만 오류 전송
+        send_telegram_message(error_message)
 
-def get_gemini_response():
-
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-
-    prompt = """
-오늘 미국 증시 개장 전 브리핑을 작성해 주세요.
-
-반드시 최신 웹 검색 정보를 사용하세요.
-
-다음 내용을 중심으로 확인하세요.
-
-1. 미국 주요 지수
-   - S&P 500
-   - Nasdaq
-   - Dow Jones
-
-2. 미국 국채 금리와 연준
-   - 미국 10년물 국채금리
-   - 연준(Fed) 관련 주요 뉴스
-   - 금리 전망에 영향을 줄 만한 내용
-
-3. 주요 경제지표
-   - CPI
-   - PPI
-   - 고용지표
-   - GDP
-   - 기타 시장에 중요한 최신 경제지표
-
-4. 빅테크 및 주요 기업 뉴스
-   - NVIDIA
-   - Apple
-   - Microsoft
-   - Amazon
-   - Alphabet
-   - Meta
-   - Tesla
-   - 기타 미국 증시에 중요한 기업
-
-5. 오늘 미국 증시에 영향을 줄 가능성이 높은 핵심 뉴스
-
-6. 오늘 투자자들이 특히 주의해서 볼 포인트
-
-작성 규칙:
-
-- 최신 웹 검색 정보를 기준으로 작성하세요.
-- 확인되지 않은 정보는 절대로 만들어내지 마세요.
-- 가능하면 최근 24시간 이내의 정보를 우선하세요.
-- 한국어로 작성하세요.
-- 너무 길지 않게 핵심만 정리하세요.
-- 주식 매수/매도를 직접적으로 권유하지 마세요.
-
-다음 형식으로 작성하세요.
-
-🚨 [미국 증시 개장 전 브리핑]
-
-📊 주요 지수
-- S&P 500:
-- Nasdaq:
-- Dow Jones:
-
-💰 금리 및 연준
-- 미국 10년물 국채금리:
-- 연준 관련 핵심 내용:
-
-📈 주요 경제지표
-- 오늘 발표 예정:
-- 최근 발표된 주요 지표:
-
-🏢 빅테크 및 주요 기업
-- NVIDIA:
-- Apple:
-- Microsoft:
-- Amazon:
-- Alphabet:
-- Meta:
-- Tesla:
-
-🔥 오늘의 핵심 뉴스
-1.
-2.
-3.
-
-👀 오늘 주목할 포인트
-- 
-- 
-- 
-
-※ 본 내용은 정보 제공 목적이며 투자 권유가 아닙니다.
-"""
-
-    # Google Search grounding
-    search_tool = types.Tool(
-        google_search=types.GoogleSearch()
-    )
-
-    config = types.GenerateContentConfig(
-        tools=[search_tool],
-        max_output_tokens=2500,
-    )
+        # GitHub Actions를 강제로 실패시키지 않음
+        return
 
     # --------------------------------------------------------
-    # 모델별 시도
+    # Gemini 요청
     # --------------------------------------------------------
 
-    last_error = None
+    try:
 
-    for model_name in MODELS:
+        briefing = generate_market_briefing()
 
-        print(f"Gemini API 요청 시작: {model_name}")
+    except Exception as e:
 
-        # 각 모델에 대해 최대 2번 시도
-        for attempt in range(2):
+        error_text = str(e)
 
-            try:
+        print("Gemini API 최종 실패")
+        print(error_text)
 
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config,
-                )
+        # ----------------------------------------------------
+        # 429 quota 오류인 경우 사용자에게 명확하게 안내
+        # ----------------------------------------------------
 
-                # 응답 확인
-                if response is None:
-                    raise ValueError(
-                        "Gemini가 빈 응답을 반환했습니다."
-                    )
+        lower_error = error_text.lower()
 
-                text = response.text
+        if (
+            "429" in lower_error
+            or "resource_exhausted" in lower_error
+            or "quota" in lower_error
+        ):
 
-                if not text or not text.strip():
-                    raise ValueError(
-                        "Gemini 응답 내용이 비어 있습니다."
-                    )
+            telegram_message = (
+                "🚨 [미국 증시 개장 전 브리핑]\n\n"
+                "Gemini API 사용량 제한에 도달했습니다.\n\n"
+                "현재 Gemini API가 429 "
+                "RESOURCE_EXHAUSTED를 반환했습니다.\n\n"
+                "자동 재시도를 수행했지만 성공하지 못했습니다.\n\n"
+                "확인할 사항:\n"
+                "1. Gemini API 사용량\n"
+                "2. RPM / TPM / RPD quota\n"
+                "3. Google AI Studio의 사용량 및 결제 상태\n\n"
+                "※ API 키를 여러 개 만들어도 같은 프로젝트의 "
+                "quota는 공유될 수 있습니다."
+            )
 
-                print(
-                    f"Gemini 응답 성공: {model_name}"
-                )
+        else:
 
-                return text.strip()
+            telegram_message = (
+                "🚨 [미국 증시 개장 전 브리핑]\n\n"
+                "Gemini API 요청 중 오류가 발생했습니다.\n\n"
+                f"오류 내용:\n{error_text}"
+            )
 
-            except Exception as error:
+        # ----------------------------------------------------
+        # Telegram 오류 알림
+        # ----------------------------------------------------
 
-                last_error = error
+        send_telegram_message(telegram_message)
 
-                error_text = str(error)
+        # ----------------------------------------------------
+        # 중요:
+        # 여기서 raise 하지 않습니다.
+        #
+        # 따라서 Gemini가 실패하더라도
+        # GitHub Actions가 exit code 1로 종료되지 않습니다.
+        # ----------------------------------------------------
 
-                print(
-                    f"Gemini 오류 "
-                    f"(모델={model_name}, "
-                    f"시도={attempt + 1}/2): "
-                    f"{error_text}"
-                )
+        print(
+            "Gemini 오류를 Telegram으로 알렸습니다."
+        )
 
-                # 429 RESOURCE_EXHAUSTED
-                if (
-                    "429" in error_text
-                    or "RESOURCE_EXHAUSTED" in error_text
-                    or "TooManyRequests" in error_text
-                ):
+        print(
+            "GitHub Actions 작업을 정상 종료합니다."
+        )
 
-                    # 바로 반복 요청하지 않고 잠시 대기
-                    wait_seconds = 10 * (attempt + 1)
+        return
 
-                    print(
-                        f"API 사용량 제한 감지. "
-                        f"{wait_seconds}초 후 재시도합니다."
-                    )
+    # --------------------------------------------------------
+    # Gemini 성공 → Telegram 전송
+    # --------------------------------------------------------
 
-                    time.sleep(wait_seconds)
+    success = send_telegram_message(briefing)
 
-                    continue
+    if success:
 
-                # 404 모델 없음
-                if (
-                    "404" in error_text
-                    or "NOT_FOUND" in error_text
-                    or "NotFound" in error_text
-                ):
-
-                    print(
-                        f"{model_name} 모델을 사용할 수 없습니다."
-                    )
-
-                    # 다음 모델로 이동
-                    break
-
-                # API 키 문제
-                if (
-                    "401" in error_text
-                    or "403" in error_text
-                    or "API key" in error_text
-                ):
-
-                    raise ValueError(
-                        "Gemini API 키를 확인하세요.\n"
-                        f"원본 오류: {error_text}"
-                    )
-
-                # 그 외 오류는 같은 모델에서 한 번 더 시도
-                time.sleep(5)
-
-    # 모든 모델 실패
-    raise RuntimeError(
-        "모든 Gemini 모델 요청에 실패했습니다.\n"
-        f"마지막 오류: {last_error}"
-    )
-
-
-# ============================================================
-# Telegram 메시지 전송
-# ============================================================
-
-def send_telegram_message(message):
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    # Telegram 메시지 길이 제한을 고려
-    max_length = 4000
-
-    messages = []
-
-    if len(message) <= max_length:
-
-        messages.append(message)
+        print("========================================")
+        print("브리핑 전송 완료")
+        print("========================================")
 
     else:
 
-        # 긴 메시지는 여러 개로 분리
-        for i in range(0, len(message), max_length):
-
-            messages.append(
-                message[i:i + max_length]
-            )
-
-    for part in messages:
-
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": part,
-        }
-
-        response = requests.post(
-            url,
-            data=data,
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-
-            raise RuntimeError(
-                "Telegram 메시지 전송 실패\n"
-                f"HTTP 상태 코드: {response.status_code}\n"
-                f"응답: {response.text}"
-            )
-
-        print("Telegram 메시지 전송 성공")
-
-        # 너무 빠른 연속 전송 방지
-        time.sleep(1)
-
-
-# ============================================================
-# 오류 발생 시 Telegram으로 오류 알림
-# ============================================================
-
-def send_error_message(error):
-
-    error_text = str(error)
-
-    message = (
-        "🚨 [미국 증시 개장 전 브리핑]\n\n"
-        "Gemini API 요청 중 오류가 발생했습니다.\n\n"
-        f"오류 내용:\n{error_text}"
-    )
-
-    try:
-
-        send_telegram_message(message)
-
-    except Exception as telegram_error:
-
         print(
-            "오류 메시지 Telegram 전송도 실패했습니다:"
+            "Gemini 브리핑 생성은 성공했지만 "
+            "Telegram 전송에 실패했습니다."
         )
-
-        print(telegram_error)
-
-
-# ============================================================
-# 메인 실행
-# ============================================================
-
-def main():
-
-    print("=" * 60)
-    print("미국 증시 개장 전 브리핑 봇 시작")
-    print("=" * 60)
-
-    try:
-
-        # 1. 환경변수 확인
-        print("1. 환경변수 확인 중...")
-
-        check_environment()
-
-        print("환경변수 확인 완료")
-
-        # 2. Gemini 요청
-        print()
-        print("2. Gemini API 요청 중...")
-
-        briefing = get_gemini_response()
-
-        print("Gemini 응답 수신 완료")
-
-        # 3. Telegram 전송
-        print()
-        print("3. Telegram 메시지 전송 중...")
-
-        send_telegram_message(briefing)
-
-        print()
-        print("=" * 60)
-        print("미국 증시 브리핑 전송 완료")
-        print("=" * 60)
-
-    except Exception as error:
-
-        print()
-        print("=" * 60)
-        print("프로그램 실행 중 오류 발생")
-        print("=" * 60)
-
-        print(str(error))
-
-        # Telegram으로 오류 알림
-        send_error_message(error)
-
-        # GitHub Actions에서 실패로 표시
-        raise
 
 
 # ============================================================
