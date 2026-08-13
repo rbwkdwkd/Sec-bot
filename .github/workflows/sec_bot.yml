@@ -1,13 +1,19 @@
-name: US Stock Pre-Market Briefing
+name: US Stock Strategy Radar
 
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "5 * * * *"
+
 jobs:
-  run-bot:
+
+  analyze:
+
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -21,10 +27,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Market Bot
+      - name: Run Strategy Radar
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
           python main.py
