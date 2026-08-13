@@ -1,235 +1,180 @@
 import os
 import time
+from datetime import datetime, timezone, timedelta
+
+import pandas as pd
 import requests
-from datetime import datetime
 import yfinance as yf
 
-# ============================================================
-# 환경변수
-# ============================================================
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# =========================================================
+# 🇰🇷 한국 주식 전략 레이더
+# =========================================================
 
-# 현재 사용 가능한 Gemini 모델
-# 2.0-flash 대신 2.5-flash 사용
-GEMINI_MODEL = os.environ.get(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash"
-).strip()
+KST = timezone(timedelta(hours=9))
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# ============================================================
-# 한국 주식 후보군
-#
-# 대형 / 중형 / 소형을 섞어서 검색
-# ============================================================
-
+# ---------------------------------------------------------
+# 한국 주요 관심종목
+# ---------------------------------------------------------
 STOCKS = {
-    # -------------------------
-    # 대형주
-    # -------------------------
-    "005930.KS": {
+    "005930": {
         "name": "삼성전자",
-        "code": "005930",
+        "sector": "반도체",
         "type": "대형주",
-        "sector": "반도체"
+        "market": "KS",
     },
-
-    "000660.KS": {
+    "000660": {
         "name": "SK하이닉스",
-        "code": "000660",
+        "sector": "HBM/반도체",
         "type": "대형주",
-        "sector": "HBM/반도체"
+        "market": "KS",
     },
-
-    "373220.KS": {
-        "name": "LG에너지솔루션",
-        "code": "373220",
-        "type": "대형주",
-        "sector": "2차전지"
-    },
-
-    "207940.KS": {
-        "name": "삼성바이오로직스",
-        "code": "207940",
-        "type": "대형주",
-        "sector": "바이오"
-    },
-
-    "005380.KS": {
-        "name": "현대차",
-        "code": "005380",
-        "type": "대형주",
-        "sector": "자동차"
-    },
-
-    "035420.KS": {
+    "035420": {
         "name": "NAVER",
-        "code": "035420",
+        "sector": "인터넷",
         "type": "대형주",
-        "sector": "인터넷"
+        "market": "KS",
     },
-
-    "012330.KS": {
-        "name": "현대모비스",
-        "code": "012330",
-        "type": "대형주",
-        "sector": "자동차부품"
-    },
-
-    "068270.KS": {
-        "name": "셀트리온",
-        "code": "068270",
-        "type": "대형주",
-        "sector": "바이오"
-    },
-
-    # -------------------------
-    # 중형주
-    # -------------------------
-
-    "403870.KQ": {
-        "name": "HPSP",
-        "code": "403870",
-        "type": "중형주",
-        "sector": "반도체 장비"
-    },
-
-    "066970.KQ": {
-        "name": "엘앤에프",
-        "code": "066970",
-        "type": "중형주",
-        "sector": "2차전지"
-    },
-
-    "272210.KS": {
+    "272210": {
         "name": "한화시스템",
-        "code": "272210",
+        "sector": "방산",
         "type": "중형주",
-        "sector": "방산"
+        "market": "KS",
     },
-
-    "108490.KQ": {
-        "name": "로보티즈",
-        "code": "108490",
-        "type": "중형주",
-        "sector": "로봇"
-    },
-
-    "079550.KS": {
+    "079550": {
         "name": "LIG넥스원",
-        "code": "079550",
-        "type": "중형주",
-        "sector": "방산"
+        "sector": "방산",
+        "type": "대형주",
+        "market": "KS",
     },
-
-    "298040.KS": {
-        "name": "효성중공업",
-        "code": "298040",
-        "type": "중형주",
-        "sector": "전력기기"
-    },
-
-    "047810.KS": {
+    "047810": {
         "name": "한국항공우주",
-        "code": "047810",
-        "type": "중형주",
-        "sector": "방산"
+        "sector": "방산",
+        "type": "대형주",
+        "market": "KS",
     },
-
-    # -------------------------
-    # 소형주 / 성장주
-    # -------------------------
-
-    "095340.KQ": {
+    "298040": {
+        "name": "효성중공업",
+        "sector": "전력기기",
+        "type": "대형주",
+        "market": "KS",
+    },
+    "403870": {
+        "name": "HPSP",
+        "sector": "반도체 장비",
+        "type": "중형주",
+        "market": "KQ",
+    },
+    "095340": {
         "name": "ISC",
-        "code": "095340",
-        "type": "소형주",
-        "sector": "반도체 부품"
+        "sector": "반도체 부품",
+        "type": "중소형주",
+        "market": "KQ",
     },
-
-    "039030.KQ": {
-        "name": "이오테크닉스",
-        "code": "039030",
-        "type": "소형주",
-        "sector": "반도체 장비"
-    },
-
-    "058470.KQ": {
-        "name": "리노공업",
-        "code": "058470",
-        "type": "소형주",
-        "sector": "반도체 부품"
-    },
-
-    "196170.KQ": {
-        "name": "알테오젠",
-        "code": "196170",
+    "108490": {
+        "name": "로보티즈",
+        "sector": "로봇",
         "type": "중형주",
-        "sector": "바이오"
+        "market": "KQ",
     },
-
-    "141080.KQ": {
-        "name": "레고켐바이오",
-        "code": "141080",
-        "type": "소형주",
-        "sector": "바이오"
-    },
-
-    "950160.KQ": {
+    "950160": {
         "name": "코오롱티슈진",
-        "code": "950160",
+        "sector": "바이오",
         "type": "소형주",
-        "sector": "바이오"
+        "market": "KQ",
     },
-
-    "214150.KQ": {
-        "name": "클래시스",
-        "code": "214150",
+    "066970": {
+        "name": "엘앤에프",
+        "sector": "2차전지",
         "type": "중형주",
-        "sector": "의료기기"
+        "market": "KS",
     },
-
-    "277810.KQ": {
-        "name": "레인보우로보틱스",
-        "code": "277810",
+    "036540": {
+        "name": "SFA반도체",
+        "sector": "반도체",
+        "type": "중소형주",
+        "market": "KQ",
+    },
+    "042700": {
+        "name": "한미반도체",
+        "sector": "반도체 장비",
+        "type": "대형주",
+        "market": "KS",
+    },
+    "247540": {
+        "name": "에코프로비엠",
+        "sector": "2차전지",
+        "type": "대형주",
+        "market": "KQ",
+    },
+    "086520": {
+        "name": "에코프로",
+        "sector": "2차전지",
+        "type": "대형주",
+        "market": "KQ",
+    },
+    "196170": {
+        "name": "알테오젠",
+        "sector": "바이오",
+        "type": "대형주",
+        "market": "KQ",
+    },
+    "141080": {
+        "name": "리가켐바이오",
+        "sector": "바이오",
         "type": "중형주",
-        "sector": "로봇"
-    }
+        "market": "KQ",
+    },
+    "012450": {
+        "name": "한화에어로스페이스",
+        "sector": "방산",
+        "type": "대형주",
+        "market": "KS",
+    },
+    "042660": {
+        "name": "한화오션",
+        "sector": "조선",
+        "type": "대형주",
+        "market": "KS",
+    },
+    "010130": {
+        "name": "고려아연",
+        "sector": "금속",
+        "type": "대형주",
+        "market": "KS",
+    },
+    "034730": {
+        "name": "SK",
+        "sector": "지주",
+        "type": "대형주",
+        "market": "KS",
+    },
 }
 
 
-# ============================================================
-# 숫자 안전 처리
-# ============================================================
+# =========================================================
+# Yahoo Finance 조회
+# =========================================================
 
-def safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return default
+def get_stock_data(code, info):
 
-        value = float(value)
+    market = info["market"]
 
-        if value != value:
-            return default
+    # 정상 거래소부터 시도
+    tickers = [
+        f"{code}.{market}"
+    ]
 
-        return value
+    # 혹시 거래소가 바뀐 경우 반대 시장도 시도
+    opposite = "KQ" if market == "KS" else "KS"
+    tickers.append(f"{code}.{opposite}")
 
-    except:
-        return default
-
-
-# ============================================================
-# 시장 데이터 수집
-# ============================================================
-
-def get_stock_data():
-
-    results = []
-
-    for ticker, info in STOCKS.items():
+    for ticker in tickers:
 
         try:
 
@@ -238,102 +183,77 @@ def get_stock_data():
                 period="1mo",
                 interval="1d",
                 progress=False,
-                auto_adjust=False
+                auto_adjust=False,
+                threads=False
             )
 
             if data is None or data.empty:
                 continue
 
-            # MultiIndex 처리
-            if hasattr(data.columns, "levels"):
-                try:
-                    close = data["Close"]
-
-                    if hasattr(close, "columns"):
-                        close = close.iloc[:, 0]
-
-                    volume = data["Volume"]
-
-                    if hasattr(volume, "columns"):
-                        volume = volume.iloc[:, 0]
-
-                except:
-                    continue
-
+            # MultiIndex 대응
+            if isinstance(data.columns, pd.MultiIndex):
+                close = data["Close"].iloc[:, 0]
+                volume = data["Volume"].iloc[:, 0]
             else:
                 close = data["Close"]
                 volume = data["Volume"]
 
-            close = close.dropna()
-            volume = volume.dropna()
+            close = pd.to_numeric(close, errors="coerce").dropna()
+            volume = pd.to_numeric(volume, errors="coerce").dropna()
 
             if len(close) < 5:
                 continue
 
-            current = safe_float(close.iloc[-1])
+            current = float(close.iloc[-1])
 
-            previous = safe_float(close.iloc[-2])
-
-            week_price = safe_float(close.iloc[-6]) if len(close) >= 6 else previous
-
-            avg_volume = safe_float(
-                volume.iloc[-21:-1].mean()
-            ) if len(volume) >= 21 else safe_float(
-                volume.iloc[:-1].mean()
-            )
-
-            current_volume = safe_float(volume.iloc[-1])
-
-            if previous != 0:
-                daily_change = (
-                    (current - previous)
-                    / previous
-                    * 100
-                )
+            # 전일 대비
+            if len(close) >= 2:
+                daily = ((current / float(close.iloc[-2])) - 1) * 100
             else:
-                daily_change = 0
+                daily = 0
 
-            if week_price != 0:
-                weekly_change = (
-                    (current - week_price)
-                    / week_price
-                    * 100
-                )
+            # 5거래일 기준
+            if len(close) >= 6:
+                weekly = ((current / float(close.iloc[-6])) - 1) * 100
             else:
-                weekly_change = 0
+                weekly = 0
+
+            # 거래량 평균
+            if len(volume) >= 21:
+                avg_volume = float(volume.iloc[-21:-1].mean())
+            else:
+                avg_volume = float(volume.iloc[:-1].mean())
+
+            today_volume = float(volume.iloc[-1])
 
             if avg_volume > 0:
-                volume_ratio = current_volume / avg_volume
+                volume_ratio = today_volume / avg_volume
             else:
-                volume_ratio = 1
+                volume_ratio = 1.0
 
-            results.append({
-                "ticker": ticker,
+            return {
+                "code": code,
                 "name": info["name"],
-                "code": info["code"],
-                "type": info["type"],
                 "sector": info["sector"],
+                "type": info["type"],
+                "market": market,
+                "ticker": ticker,
                 "price": current,
-                "daily": daily_change,
-                "weekly": weekly_change,
-                "volume_ratio": volume_ratio
-            })
+                "daily": daily,
+                "weekly": weekly,
+                "volume_ratio": volume_ratio,
+            }
 
         except Exception as e:
+            print(f"{ticker} 조회 실패: {e}")
 
-            print(
-                f"{info['name']} 데이터 오류: {e}"
-            )
-
-    return results
+    print(f"{code} {info['name']} 데이터 조회 실패")
+    return None
 
 
-# ============================================================
-# 데이터 점수 계산
-#
-# AI가 만든 점수가 아니라
-# 실제 가격/거래량 계산값
-# ============================================================
+# =========================================================
+# 데이터 점수
+# =========================================================
 
 def calculate_score(stock):
 
@@ -343,27 +263,27 @@ def calculate_score(stock):
 
     score = 50.0
 
-    # 일간 상승 모멘텀
+    # 일간 상승
     if daily >= 10:
         score += 20
     elif daily >= 5:
-        score += 12
+        score += 15
     elif daily >= 3:
-        score += 7
-    elif daily >= 0:
-        score += 3
-    elif daily <= -10:
-        score -= 15
-    elif daily <= -5:
+        score += 10
+    elif daily >= 1:
+        score += 5
+    elif daily < -5:
         score -= 10
+    elif daily < -10:
+        score -= 15
 
-    # 주간 모멘텀
+    # 주간 상승
     if weekly >= 20:
         score += 15
     elif weekly >= 10:
         score += 10
     elif weekly >= 5:
-        score += 6
+        score += 5
     elif weekly < -10:
         score -= 10
 
@@ -371,9 +291,9 @@ def calculate_score(stock):
     if volume >= 3:
         score += 15
     elif volume >= 2:
-        score += 12
+        score += 10
     elif volume >= 1.5:
-        score += 8
+        score += 7
     elif volume >= 1.2:
         score += 4
     elif volume < 0.7:
@@ -384,21 +304,21 @@ def calculate_score(stock):
     return round(score, 1)
 
 
-# ============================================================
-# 상태 판정
-# ============================================================
+# =========================================================
+# 상태
+# =========================================================
 
 def get_status(stock, score):
 
     daily = stock["daily"]
+    weekly = stock["weekly"]
     volume = stock["volume_ratio"]
 
-    # 너무 많이 오른 경우
-    if daily >= 20:
+    # 과열
+    if daily >= 15 and volume >= 2:
         return "⚠️ 과열주의"
 
-    # 강한 거래량 + 상승
-    if score >= 80 and volume >= 2:
+    if score >= 80:
         return "🚀 급등 관심"
 
     if score >= 70:
@@ -410,146 +330,174 @@ def get_status(stock, score):
     return "🔎 관찰"
 
 
-# ============================================================
-# TOP 10 선정
-# ============================================================
+# =========================================================
+# Gemini AI
+# =========================================================
 
-def select_top10(data):
-
-    for stock in data:
-
-        stock["score"] = calculate_score(stock)
-
-        stock["status"] = get_status(
-            stock,
-            stock["score"]
-        )
-
-    data.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
-    return data[:10]
-
-
-# ============================================================
-# Gemini AI 분석
-# ============================================================
-
-def ask_gemini(top10):
+def run_gemini_analysis(stocks):
 
     if not GEMINI_API_KEY:
-
         return (
             "⚠️ Gemini API 키가 설정되지 않았습니다.\n\n"
-            "시장 데이터 기반 레이더는 정상적으로 작동합니다."
+            "시장 데이터 분석은 정상적으로 완료되었습니다."
         )
 
-    market_text = ""
+    try:
 
-    for i, stock in enumerate(top10, 1):
+        from google import genai
 
-        market_text += f"""
-{i}. {stock['name']} ({stock['code']})
-현재가: {stock['price']:.2f}
-일간: {stock['daily']:+.2f}%
-주간: {stock['weekly']:+.2f}%
-거래량: {stock['volume_ratio']:.2f}배
-데이터 점수: {stock['score']}/100
-유형: {stock['type']}
-섹터: {stock['sector']}
-"""
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
-    prompt = f"""
-당신은 한국 주식시장을 분석하는 시니어 전략 분석가입니다.
+        stock_text = ""
 
-아래는 실제 시장 데이터로 계산된 한국 주식 TOP 10입니다.
+        for i, s in enumerate(stocks, 1):
+            stock_text += (
+                f"{i}. {s['name']} ({s['code']})\n"
+                f"현재가: {s['price']:,.0f}원\n"
+                f"일간: {s['daily']:+.2f}%\n"
+                f"주간: {s['weekly']:+.2f}%\n"
+                f"거래량: {s['volume_ratio']:.2f}배\n"
+                f"데이터 점수: {s['score']}/100\n"
+                f"섹터: {s['sector']}\n\n"
+            )
 
-{market_text}
+        prompt = f"""
+너는 한국 주식 시장을 분석하는 시니어 전략 분석가다.
 
-중요:
-- 확인되지 않은 뉴스나 공시를 만들어내지 마세요.
-- 실제로 제공된 데이터와 일반적인 시장 해석을 구분하세요.
-- 특정 종목의 상승을 보장한다고 말하지 마세요.
-- "성공확률"을 실제 통계처럼 꾸며서 제시하지 마세요.
-- 대신 "상승 시나리오", "하락 위험", "확인할 조건"을 제시하세요.
-- 급등한 종목은 추격매수 위험을 반드시 평가하세요.
-- 소형주도 분석하되 유동성과 변동성 위험을 강조하세요.
+아래는 실제 시장 데이터로 계산된 TOP 10 종목이다.
 
-특히 다음을 분석하세요.
+{stock_text}
 
-1. 오늘 TOP 10 중 가장 강한 모멘텀 3개
-2. 단기 반등 후보 3개
-3. 급등 추격매수 주의 종목
-4. 대형주 / 중형주 / 소형주 중 어떤 쪽이 유리한지
-5. 반도체 / 방산 / 로봇 / 바이오 / 2차전지 등 강한 섹터
-6. 오늘 장에서 확인해야 할 조건
-7. 급락 위험이 높은 상황
-8. 내일도 관심을 유지할 종목 3개
+다음 원칙을 반드시 지켜라.
 
-출력은 텔레그램에 바로 보낼 수 있도록 간결하게 작성하세요.
+1. 제공된 가격/거래량/점수를 임의로 수정하지 않는다.
+2. 확인하지 않은 뉴스나 공시를 만들어내지 않는다.
+3. 주가 상승 확률을 숫자로 임의 생성하지 않는다.
+4. 특정 종목의 매수/매도를 단정하지 않는다.
+5. 각 종목의 강점과 위험요인을 간단하게 설명한다.
+6. 가능하면 최근 뉴스/공시를 Google Search로 확인한다.
+7. 최근 뉴스가 확인되지 않으면 "확인되지 않음"이라고 표시한다.
+8. 투자자에게 가장 중요한 리스크를 우선적으로 설명한다.
 
-형식:
+답변 형식:
 
 🤖 AI 시니어 전략 분석
 
-🔥 오늘의 핵심
-- ...
+🥇 1위 종목
+- 강점:
+- 위험:
+- 체크할 뉴스/공시:
 
-🎯 단기 모멘텀 TOP 3
-1. 종목:
-   이유:
-   확인조건:
+🥈 2위 종목
+- 강점:
+- 위험:
+- 체크할 뉴스/공시:
 
-2. ...
+🥉 3위 종목
+- 강점:
+- 위험:
+- 체크할 뉴스/공시:
 
-🔄 반등 후보 TOP 3
-1. 종목:
-   이유:
-   반등 조건:
+📌 전체 시장 관찰
+- 현재 강한 섹터:
+- 주의할 섹터:
+- 가장 중요한 리스크:
 
-⚠️ 급락/추격매수 주의
-- ...
+마지막에 반드시:
 
-🏭 강한 섹터
-- ...
-
-📌 내일 관심
-- ...
-
-⚠️ 반드시 확인
-- 실적
-- 공시
-- 거래량
-- 시장지수
-- 외국인/기관 수급
-
-마지막에 다음 문장을 포함하세요.
-
-"본 분석은 투자 참고용이며 수익을 보장하지 않습니다."
+"※ 본 분석은 투자 참고용이며 수익을 보장하지 않습니다."
 """
 
+        # 최신 모델부터 시도
+        models = [
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+        ]
+
+        last_error = None
+
+        for model in models:
+
+            try:
+
+                print(f"Gemini 모델 시도: {model}")
+
+                interaction = client.interactions.create(
+                    model=model,
+                    input=prompt,
+                    tools=[
+                        {"type": "google_search"}
+                    ]
+                )
+
+                result = interaction.output_text
+
+                if result and result.strip():
+
+                    print(f"Gemini 성공: {model}")
+
+                    return (
+                        f"모델: {model}\n\n"
+                        + result.strip()
+                    )
+
+            except Exception as e:
+
+                last_error = str(e)
+
+                print(f"Gemini {model} 실패: {e}")
+
+                # 429는 모델을 바꿔도 quota 문제일 가능성이 높음
+                if "429" in str(e) or "quota" in str(e).lower():
+
+                    return (
+                        "⚠️ Gemini API 사용량 제한\n\n"
+                        "시장 데이터 수집은 정상적으로 완료되었습니다.\n\n"
+                        "하지만 Gemini API quota/rate limit에 "
+                        "도달하여 AI 최신정보 분석을 실행하지 않았습니다.\n\n"
+                        "※ API 오류 상태에서는 뉴스, 확률, "
+                        "추천 점수를 임의로 생성하지 않습니다."
+                    )
+
+                time.sleep(1)
+
+        return (
+            "⚠️ Gemini 모델 연결 실패\n\n"
+            "시장 데이터 분석은 정상적으로 완료되었습니다.\n\n"
+            "현재 사용 가능한 Gemini 모델을 확인하지 못했습니다.\n\n"
+            f"마지막 오류: {last_error}"
+        )
+
+    except Exception as e:
+
+        return (
+            "⚠️ Gemini 분석 실행 실패\n\n"
+            "시장 데이터 분석은 정상적으로 완료되었습니다.\n\n"
+            "AI가 확인하지 못한 정보는 임의로 생성하지 않았습니다.\n\n"
+            f"오류: {e}"
+        )
+
+
+# =========================================================
+# 텔레그램
+# =========================================================
+
+def send_telegram(message):
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram 설정 없음")
+        return False
+
     url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{GEMINI_MODEL}:generateContent"
-        f"?key={GEMINI_API_KEY}"
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 1800
-        }
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
     }
 
     try:
@@ -560,258 +508,223 @@ def ask_gemini(top10):
             timeout=30
         )
 
-        try:
-            result = response.json()
-        except:
-            result = {}
+        print("Telegram:", response.status_code)
 
-        if response.status_code == 200:
-
-            candidates = result.get(
-                "candidates",
-                []
-            )
-
-            if candidates:
-
-                parts = candidates[0].get(
-                    "content",
-                    {}
-                ).get(
-                    "parts",
-                    []
-                )
-
-                if parts:
-
-                    return parts[0].get(
-                        "text",
-                        ""
-                    )
-
-            return (
-                "⚠️ Gemini 응답 내용이 없습니다."
-            )
-
-        # 429
-        if response.status_code == 429:
-
-            return (
-                "⚠️ Gemini 사용량 제한\n\n"
-                "현재 Gemini API의 RPM/TPM/RPD "
-                "또는 프로젝트 quota를 초과했습니다.\n\n"
-                "시장 데이터 TOP 10은 정상적으로 "
-                "수집되었으며 AI 분석만 다음 실행으로 "
-                "넘어갑니다."
-            )
-
-        # 404
-        if response.status_code == 404:
-
-            return (
-                "⚠️ Gemini 모델 연결 오류\n\n"
-                f"현재 모델: {GEMINI_MODEL}\n\n"
-                "Google AI Studio에서 현재 프로젝트가 "
-                "사용 가능한 모델인지 확인하세요."
-            )
-
-        error = result.get(
-            "error",
-            {}
-        ).get(
-            "message",
-            "알 수 없는 오류"
-        )
-
-        return (
-            f"⚠️ Gemini API 오류\n\n"
-            f"{error}"
-        )
-
-    except requests.exceptions.Timeout:
-
-        return (
-            "⚠️ Gemini 응답 시간 초과\n\n"
-            "시장 데이터 분석은 정상적으로 완료되었습니다."
-        )
+        return response.ok
 
     except Exception as e:
 
-        return (
-            "⚠️ Gemini 연결 실패\n\n"
-            f"{str(e)[:500]}"
-        )
+        print("Telegram 오류:", e)
 
-
-# ============================================================
-# 텔레그램 전송
-# ============================================================
-
-def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN 없음")
         return False
 
-    if not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_CHAT_ID 없음")
-        return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+# =========================================================
+# 메시지 생성
+# =========================================================
+
+def make_message(stocks, ai_text):
+
+    now = datetime.now(KST)
+
+    msg = []
+
+    msg.append("🚨 한국 주식 전략 레이더")
+    msg.append("")
+    msg.append(
+        f"⏰ {now.strftime('%Y-%m-%d %H:%M:%S')} KST"
     )
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
+    msg.append("")
+    msg.append("━━━━━━━━━━━━━━━━━━")
+    msg.append("🇰🇷 KOSPI / KOSDAQ TOP 10")
+    msg.append("━━━━━━━━━━━━━━━━━━")
 
-    try:
+    for i, s in enumerate(stocks[:10], 1):
 
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=15
+        msg.append("")
+        msg.append(
+            f"{i}️⃣ {s['name']}"
         )
 
-        print(
-            "Telegram:",
-            response.status_code
+        msg.append(
+            f"({s['code']})"
         )
 
-        return response.status_code == 200
-
-    except Exception as e:
-
-        print(
-            "Telegram 오류:",
-            e
+        msg.append("")
+        msg.append(
+            f"💵 현재가: {s['price']:,.0f}원"
         )
 
-        return False
+        msg.append(
+            f"📈 일간: {s['daily']:+.2f}%"
+        )
 
+        msg.append(
+            f"📊 주간: {s['weekly']:+.2f}%"
+        )
 
-# ============================================================
-# 메시지 작성
-# ============================================================
+        msg.append(
+            f"🔥 거래량: {s['volume_ratio']:.2f}배"
+        )
 
-def build_message(top10, ai_text):
+        msg.append("")
+        msg.append(
+            f"⭐ 데이터 점수: {s['score']}/100"
+        )
 
-    now = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
+        msg.append(
+            f"📌 상태: {s['status']}"
+        )
+
+        msg.append(
+            f"🏷 유형: {s['type']}"
+        )
+
+        msg.append(
+            f"🏭 섹터: {s['sector']}"
+        )
+
+    msg.append("")
+    msg.append("━━━━━━━━━━━━━━━━━━")
+    msg.append("🤖 AI 시니어 전략 분석")
+    msg.append("━━━━━━━━━━━━━━━━━━")
+
+    msg.append("")
+    msg.append(ai_text)
+
+    msg.append("")
+    msg.append("━━━━━━━━━━━━━━━━━━")
+    msg.append("⚠️ 투자 주의")
+    msg.append("━━━━━━━━━━━━━━━━━━")
+
+    msg.append("")
+    msg.append(
+        "본 프로그램은 실제 시장 가격/거래량을"
+    )
+    msg.append(
+        "기반으로 관심 종목을 자동 선별합니다."
     )
 
-    text = f"""
-🚨 한국 주식 전략 레이더
+    msg.append("")
+    msg.append(
+        "데이터 점수와 AI 분석은"
+    )
+    msg.append(
+        "주가 상승을 보장하는 확률이 아닙니다."
+    )
 
-⏰ {now} KST
+    msg.append("")
+    msg.append(
+        "특히 급등주와 소형주는"
+    )
+    msg.append(
+        "변동성과 손실 위험이 높습니다."
+    )
 
-━━━━━━━━━━━━━━━━━━
-🇰🇷 KOSPI / KOSDAQ TOP 10
-━━━━━━━━━━━━━━━━━━
-"""
+    msg.append("")
+    msg.append(
+        "AI가 확인하지 못한 뉴스나 공시는"
+    )
+    msg.append(
+        "임의로 생성하지 않습니다."
+    )
 
-    for i, stock in enumerate(top10, 1):
+    msg.append("")
+    msg.append(
+        "투자 전 실적, 공시, 거래대금,"
+    )
+    msg.append(
+        "외국인/기관 수급 및 시장 상황을"
+    )
+    msg.append(
+        "추가 확인하세요."
+    )
 
-        text += f"""
-{i}️⃣ {stock['name']}
-({stock['code']})
+    msg.append("")
+    msg.append(
+        "※ 본 분석은 투자 참고용이며 "
+        "수익을 보장하지 않습니다."
+    )
 
-💵 현재가: {stock['price']:,.0f}원
-📈 일간: {stock['daily']:+.2f}%
-📊 주간: {stock['weekly']:+.2f}%
-🔥 거래량: {stock['volume_ratio']:.2f}배
-
-⭐ 데이터 점수: {stock['score']}/100
-📌 상태: {stock['status']}
-🏷 유형: {stock['type']}
-🏭 섹터: {stock['sector']}
-
-"""
-
-    text += """
-━━━━━━━━━━━━━━━━━━
-🤖 AI 시니어 전략 분석
-━━━━━━━━━━━━━━━━━━
-
-"""
-
-    text += ai_text
-
-    text += """
-
-━━━━━━━━━━━━━━━━━━
-⚠️ 투자 주의
-━━━━━━━━━━━━━━━━━━
-
-본 프로그램은 실제 시장 가격/거래량을
-기반으로 관심 종목을 자동 선별합니다.
-
-데이터 점수와 AI 분석은
-주가 상승을 보장하는 확률이 아닙니다.
-
-특히 급등주와 소형주는
-변동성과 손실 위험이 높습니다.
-
-실적, 공시, 거래대금, 외국인/기관 수급,
-시장지수 등을 반드시 추가 확인하세요.
-
-본 분석은 투자 참고용이며
-수익을 보장하지 않습니다.
-"""
-
-    return text
+    return "\n".join(msg)
 
 
-# ============================================================
-# 메인
-# ============================================================
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
 
-    print("================================")
+    print("=" * 40)
     print("한국 주식 전략 레이더 시작")
-    print("================================")
+    print("=" * 40)
+
+    results = []
 
     print("1. 한국 시장 데이터 수집 중...")
 
-    data = get_stock_data()
+    for code, info in STOCKS.items():
 
-    if not data:
+        data = get_stock_data(code, info)
 
-        send_telegram(
+        if data:
+
+            data["score"] = calculate_score(data)
+            data["status"] = get_status(
+                data,
+                data["score"]
+            )
+
+            results.append(data)
+
+        time.sleep(0.15)
+
+    print(
+        f"시장 데이터 {len(results)}개 수집 완료"
+    )
+
+    if not results:
+
+        error_message = (
             "🚨 한국 주식 전략 레이더\n\n"
             "시장 데이터를 수집하지 못했습니다.\n\n"
             "다음 실행 주기에 다시 시도합니다."
         )
 
+        send_telegram(error_message)
+
         return
 
-    print(
-        f"시장 데이터 {len(data)}개 수집 완료"
+    # 점수순 정렬
+    results.sort(
+        key=lambda x: (
+            x["score"],
+            x["daily"],
+            x["weekly"]
+        ),
+        reverse=True
     )
 
-    print("2. TOP 10 계산 중...")
+    top10 = results[:10]
 
-    top10 = select_top10(data)
+    print("2. TOP 10 계산 완료")
 
-    if not top10:
+    for i, s in enumerate(top10, 1):
 
-        send_telegram(
-            "🚨 한국 주식 전략 레이더\n\n"
-            "분석 가능한 종목이 없습니다."
+        print(
+            f"{i}. {s['name']} "
+            f"{s['score']}점 "
+            f"{s['daily']:+.2f}%"
         )
-
-        return
 
     print("3. Gemini AI 분석 요청...")
 
-    ai_text = ask_gemini(top10)
+    ai_text = run_gemini_analysis(top10)
 
     print("4. Telegram 전송...")
 
-    message = build_message(
+    message = make_message(
         top10,
         ai_text
     )
@@ -821,7 +734,7 @@ def main():
     if success:
         print("5. 전송 성공!")
     else:
-        print("5. 전송 실패")
+        print("5. Telegram 전송 실패")
 
 
 if __name__ == "__main__":
