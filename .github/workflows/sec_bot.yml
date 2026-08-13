@@ -1,8 +1,91 @@
-- name: Run radar
-  env:
-    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-    TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-    GEMINI_MODEL: gemini-3.1-flash-lite
-  run: |
-    python main.py
+name: SEC Daily Rebound & Crash Signal Bot
+
+on:
+  # 매시간 정각에 자동 실행
+  schedule:
+    - cron: "0 * * * *"
+
+  # GitHub에서 수동 실행도 가능
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # 1. 저장소 코드 가져오기
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Python 설치
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. 필요한 라이브러리 설치
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install yfinance requests google-genai
+          fi
+
+      # 4. 환경변수 확인
+      - name: Check secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+
+          required = [
+              "TELEGRAM_BOT_TOKEN",
+              "TELEGRAM_CHAT_ID"
+          ]
+
+          for key in required:
+              if not os.getenv(key):
+                  raise SystemExit(f"❌ GitHub Secret 누락: {key}")
+
+          if not os.getenv("GEMINI_API_KEY"):
+              print("⚠️ GEMINI_API_KEY 없음")
+              print("시장 데이터 레이더만 실행될 수 있습니다.")
+          else:
+              print("✅ Gemini API Key 확인")
+          
+          print("✅ Telegram 설정 확인")
+          PY
+
+      # 5. 주식 레이더 실행
+      - name: Run stock radar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+          PYTHONUNBUFFERED: "1"
+        run: |
+          echo "========================================"
+          echo "🇺🇸 미국 주식 전략 레이더 시작"
+          echo "⏰ $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "========================================"
+
+          python main.py
+
+      # 6. 실패했을 경우 로그 표시
+      - name: Failure notice
+        if: failure()
+        run: |
+          echo "❌ 주식 레이더 실행 실패"
+          echo "GitHub Actions 로그를 확인하세요."
